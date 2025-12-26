@@ -317,39 +317,57 @@ void PreintegrationEarthOdo::resetState(const IntegrationState &state) {
 }
 
 /* 误差传播函数：根据误差传播定律，建立误差微分方程，更新雅可比矩阵和协方差矩阵。
-Ref：《Impact of the Earth Rotation Compensation on MEMS-IMU Preintegration of Factor Graph Optimization》-公式14~25
+    Ref：《Impact of the Earth Rotation Compensation on MEMS-IMU Preintegration of Factor Graph Optimization》-公式14~25
 
-计算状态转移矩阵Phi（19行*19列）。
-计算噪声驱动矩阵G（19行*16列）。
-计算噪声矩阵Q（19行*19列）。
-更新雅可比矩阵J（19行*19列）。
-更新参数协方差矩阵
-（19行*19列）
+    计算状态转移矩阵Phi（19行*19列）。
+    计算噪声驱动矩阵G（19行*16列）。
+    计算噪声矩阵Q（19行*19列）。
+    更新雅可比矩阵J（19行*19列）。
+    更新参数协方差矩阵
+    （19行*19列）
 
-PS：
-雅可比矩阵不是EKF中提及的系数矩阵，系数矩阵是常数矩阵，而雅可比矩阵是包含参数的矩阵，是关于参数的一阶偏导数，会随着参数变化而变化。因此，参数更新后，雅可比矩阵也需要更新。
+    PS：
+    雅可比矩阵不是EKF中提及的系数矩阵，系数矩阵是常数矩阵，而雅可比矩阵是包含参数的矩阵，是关于参数的一阶偏导数，会随着参数变化而变化。因此，参数更新后，雅可比矩阵也需要更新。
 
-误差微分方程的维数，包括：
-    位置（3维）
-    速度（3维）
-    姿态（3维）
-    陀螺仪零偏（3维）
-    加速度计零偏（3维）
-    ODO里程增量（3维）
-    里程计比例因子（1维）。 */
+    误差微分方程的维数，包括：
+        位置（3维）
+        速度（3维）
+        姿态（3维）
+        陀螺仪零偏（3维）
+        加速度计零偏（3维）
+        ODO里程增量（3维）
+        里程计比例因子（1维）。 */
 void PreintegrationEarthOdo::updateJacobianAndCovariance(const IMU &imu_pre, const IMU &imu_cur) {
     // dp, dv, dq, dbg, dba
 
+    // 状态转移矩阵 phi，初始化为零矩阵，19*19；NUM_STATE = 19
     Eigen::MatrixXd phi = Eigen::MatrixXd::Zero(NUM_STATE, NUM_STATE);
 
-    double dt = imu_cur.dt;
+    double dt = imu_cur.dt; // 时间间隔
 
-    Vector3d dnn  = -iewn_ * delta_time_;
+    // 表示这“当前时刻/末端”的等效旋转（整体区间的累计旋转）
+    Vector3d dnn  = -iewn_ * delta_time_; 
     Matrix3d cbb0 = -(q0_.inverse() * Rotation::rotvec2quaternion(dnn) * q0_ * delta_state_.q).toRotationMatrix();
 
     // jacobian
 
-    // phi = I + F * dt
+    // phi = I + F * dt   计算状态转移矩阵Phi（19行*19列）。
+    // 矩阵按块划分，状态顺序为：p(3), v(3), q(3), bg(3), ba(3), s(3), sodo(1)
+    // 以 7x7 块矩阵表示（每个块为对应维度）：
+    // Phi = [  I        I*dt      0                  0                 0                    0                         0  ]
+    //       [  0        I         C_b^b0*Sk(dv)      0         C_b^b0*dt        C_b^b0*Sk(stheta)    -C_b^b0*cvb*dsodo ]
+    //       [  0        0         I - Sk(dtheta)    -I*dt              0                    0                         0  ]
+    //       [  0        0            0          I*(1-dt/tau)          0                    0                         0  ]
+    //       [  0        0            0               0          I*(1-dt/tau)            0                         0  ]
+    //       [  0        0            0               0               0                 I                         0  ]
+    //       [  0        0            0               0               0                 0                         1  ]
+    // 其中：
+    //  - C_b^b0 = cbb0
+    //  - Sk(x) 表示向量 x 对应的反对称矩阵 Rotation::skewSymmetric(x)
+    //  - dv 对应代码中的 imu_cur.dvel，dtheta 对应 imu_cur.dtheta
+    //  - stheta = cvb_ * [odovel,0,0]^T * (1 + delta_state_.sodo) - imu_cur.dtheta.cross(lodo_)
+    //  - dsodo = [imu_cur.odovel, 0, 0]^T
+    // 注：上面每个块的维度需按状态维数展开为具体的 3x3 或 3x1 子矩阵。
     phi.block<3, 3>(0, 0)   = Matrix3d::Identity();
     phi.block<3, 3>(0, 3)   = Matrix3d::Identity() * dt;
     phi.block<3, 3>(3, 3)   = Matrix3d::Identity();
@@ -369,10 +387,12 @@ void PreintegrationEarthOdo::updateJacobianAndCovariance(const IMU &imu_pre, con
     phi.block<3, 1>(15, 18) = -cbb0 * cvb_ * dsodo;
     phi(18, 18)             = 1.0;
 
+    // 更新雅克比矩阵
     jacobian_ = phi * jacobian_;
 
     // covariance
 
+    // gt 计算噪声驱动矩阵G（19行*16列）
     Eigen::MatrixXd gt = Eigen::MatrixXd::Zero(NUM_STATE, NUM_NOISE);
 
     gt.block<3, 3>(3, 3)   = cbb0;
@@ -383,8 +403,11 @@ void PreintegrationEarthOdo::updateJacobianAndCovariance(const IMU &imu_pre, con
     gt.block<3, 3>(15, 12) = cbb0 * cvb_ * (1 + delta_state_.sodo);
     gt(18, 15)             = 1.0;
 
+    // 计算噪声矩阵Q（19行*19列）
     Eigen::MatrixXd Qk =
         0.5 * dt * (phi * gt * noise_ * gt.transpose() + gt * noise_ * gt.transpose() * phi.transpose());
+
+    // 更新参数协方差矩阵 （19行*19列）
     covariance_ = phi * covariance_ * phi.transpose() + Qk;
 }
 
