@@ -230,13 +230,14 @@ int main(int argc, char *argv[]) {
 
         // 加入IMU数据
         // Add new imu data to preintegration
-        preintegrationlist.back()->addNewImu(imu_cur);
+        preintegrationlist.back()->addNewImu(imu_cur); // sow新于imu_cur(即if(imu_cur.time < sow))，则不会进入下面的插值，直接加入当前imu_cur
 
         imu_pre = imu_cur;
         imu_cur = imufile.next();
 
         if (imu_cur.time > sow) {
-            // 当前IMU数据时间等于GNSS数据时间, 读取新的GNSS
+            
+            // 如果当前IMU数据时间等于GNSS数据时间, 读取新的GNSS
             // add GNSS and read new GNSS
             if (fabs(gnss.time - sow) < MINIMUM_INTERVAL) {
                 gnsslist.push_back(gnss);

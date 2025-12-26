@@ -238,51 +238,73 @@ void PreintegrationEarthOdo::integrationProcess(unsigned long index) {
     end_time_           = imu_cur.time;
     current_state_.time = imu_cur.time;
 
-    // 连续状态积分, 先位置速度再姿态
+    // 1.连续状态积分(机械编排), 先位置速度再姿态
 
     // 位置速度
+
+    // 速度：“Ref：KF-GINS github项目中docs文件夹内的《kf-gins开源代码分享-i2nav-0514.pdf》”
+    // b系比力积分项：dvfb
     Vector3d dvfb = imu_cur.dvel + 0.5 * imu_cur.dtheta.cross(imu_cur.dvel) +
                     1.0 / 12.0 * (imu_pre.dtheta.cross(imu_cur.dvel) + imu_pre.dvel.cross(imu_cur.dtheta));
     // 哥氏项和重力项
     Vector3d dv_cor_g = (gravity_ - 2.0 * iewn_.cross(current_state_.v)) * dt;
 
     // 地球自转补偿项, 省去了enwn项
+        /* 在计算地球自转补偿项时，使用的投影参数是指地球自转角速度投影到n系的参数iewn_ ，
+            但是忽略了n系相对于e系转动角速度投影到n系的补偿项，而KF-GINS都考虑了 */
     Vector3d dnn    = -iewn_ * dt;
     Quaterniond qnn = Rotation::rotvec2quaternion(dnn);
 
     Vector3d dvel =
         0.5 * (Matrix3d::Identity() + qnn.toRotationMatrix()) * current_state_.q.toRotationMatrix() * dvfb + dv_cor_g;
 
+    current_state_.v += dvel;
+
+    // 位置
     // 前后历元平均速度计算位置
     current_state_.p += dt * current_state_.v + 0.5 * dt * dvel;
-    current_state_.v += dvel;
+    
 
     // 缓存IMU时刻位置, 时间间隔为两个历元的间隔
     pn_.emplace_back(std::make_pair(dt, current_state_.p));
 
-    // 姿态
+    // 姿态：Ref：KF-GINS github项目中docs文件夹内的《kf-gins开源代码分享-i2nav-0514.pdf》
     Vector3d dtheta = imu_cur.dtheta + 1.0 / 12.0 * imu_pre.dtheta.cross(imu_cur.dtheta);
 
     current_state_.q = qnn * current_state_.q * Rotation::rotvec2quaternion(dtheta);
     current_state_.q.normalize();
 
-    // 预积分
+    // 2.预积分：利用相邻节点之间的 IMU 数据预先积分出与积分起点位姿无关的相对位置、速度、姿态增量。
+        // 具体概念，详见武汉大学i2nav团队常乐的博士论文第2章的2.4小节。
 
+    // (1) ODO预积分:直接使用ODO测量的原始里程信息，积分得到里程增量。
     // 中间时刻的地球自转等效旋转矢量
-    dnn           = -(delta_time_ - 0.5 * dt) * iewn_;
-    Matrix3d cbbe = (q0_.inverse() * Rotation::rotvec2quaternion(dnn) * q0_ * delta_state_.q).toRotationMatrix();
+        // Ref：i2nav团队唐海亮博士在IEEE发表的论文《Impact of the Earth Rotation Compensation on MEMS-IMU Preintegration of Factor Graph Optimization》 -- 公式11 
+    dnn           = -(delta_time_ - 0.5 * dt) * iewn_;  // dnn: 从积分起点到当前时刻中间点的地球自转旋转矢量，dnn = - (Δt - 0.5*dt) * ω_ie^n
+    Matrix3d cbbe = (q0_.inverse() * Rotation::rotvec2quaternion(dnn) * q0_ * delta_state_.q).toRotationMatrix();  // cbbe: 补偿地球自转的旋转矩阵，C_b^b_e = q0^{-1} * exp(dnn) * q0 * Δq
 
-    // 里程增量
-    Vector3d dsodo = Vector3d(imu_cur.odovel, 0, 0);
-    delta_state_.s += cbbe * (cvb_ * dsodo * (1 + delta_state_.sodo) -
-                              Rotation::rotvec2quaternion(imu_cur.dtheta).toRotationMatrix() * lodo_ + lodo_);
+    // 里程增量：根据里程计比例因子、杆臂lodo_ ，计算里程增量，更新delta_state_.s
+        // Ref：《基于图优化的LiDAR/INS/ODO/GNSS车载组合导航算法研究》-武汉大学博士论文-常乐-公式(5.6)
+    Vector3d dsodo = Vector3d(imu_cur.odovel, 0, 0);  // dsodo: 里程计原始测量向量，dsodo = [odovel, 0, 0]^T，其中 odovel 是里程计速度测量，通常是前进速度
+    delta_state_.s += cbbe * (cvb_ * dsodo * (1 + delta_state_.sodo)
+                            - Rotation::rotvec2quaternion(imu_cur.dtheta).toRotationMatrix() * lodo_ + lodo_);
 
+    /* PS：以上ODO预积分公式涉及两个坐标系，v系和w系：
+           v系是以ODO安装所在车轮与地面的切点为原点。
+           w系的原点不变，一直在初始位置，固定在k-1时刻的e系下。*/
+
+    // (2) 速度、位置预积分:
+        // 速度预积分：利用计算的b系下的比力积分项dvfb，转为w系下
+        // 位置预积分：和之前位置更新的原理相同，不过得到的应该是w系下的位置。
+        // Ref：《Impact of the Earth Rotation Compensation on MEMS-IMU Preintegration of Factor Graph Optimization》-公式10
     // 前后历元平均速度计算位置
-    dvel = cbbe * dvfb;
+    dvel = cbbe * dvfb; 
     delta_state_.p += dt * delta_state_.v + 0.5 * dt * dvel;
     delta_state_.v += dvel;
 
     // 姿态
+        // Ref：《Impact of the Earth Rotation Compensation on MEMS-IMU Preintegration of Factor Graph Optimization》-公式10
+        // 利用本计算的k-1时刻~k时刻b系下的旋转四元数dtheta，更新姿态的相对约束,转为w系下
     delta_state_.q *= Rotation::rotvec2quaternion(dtheta);
     delta_state_.q.normalize();
 
@@ -294,6 +316,27 @@ void PreintegrationEarthOdo::resetState(const IntegrationState &state) {
     resetState(state, NUM_STATE);
 }
 
+/* 误差传播函数：根据误差传播定律，建立误差微分方程，更新雅可比矩阵和协方差矩阵。
+Ref：《Impact of the Earth Rotation Compensation on MEMS-IMU Preintegration of Factor Graph Optimization》-公式14~25
+
+计算状态转移矩阵Phi（19行*19列）。
+计算噪声驱动矩阵G（19行*16列）。
+计算噪声矩阵Q（19行*19列）。
+更新雅可比矩阵J（19行*19列）。
+更新参数协方差矩阵
+（19行*19列）
+
+PS：
+雅可比矩阵不是EKF中提及的系数矩阵，系数矩阵是常数矩阵，而雅可比矩阵是包含参数的矩阵，是关于参数的一阶偏导数，会随着参数变化而变化。因此，参数更新后，雅可比矩阵也需要更新。
+
+误差微分方程的维数，包括：
+    位置（3维）
+    速度（3维）
+    姿态（3维）
+    陀螺仪零偏（3维）
+    加速度计零偏（3维）
+    ODO里程增量（3维）
+    里程计比例因子（1维）。 */
 void PreintegrationEarthOdo::updateJacobianAndCovariance(const IMU &imu_pre, const IMU &imu_cur) {
     // dp, dv, dq, dbg, dba
 
@@ -345,6 +388,7 @@ void PreintegrationEarthOdo::updateJacobianAndCovariance(const IMU &imu_pre, con
     covariance_ = phi * covariance_ * phi.transpose() + Qk;
 }
 
+/* 初始预积分delta_state_状态变量设置 */
 void PreintegrationEarthOdo::resetState(const IntegrationState &state, int num) {
     delta_time_ = 0;
     delta_state_.p.setZero();
@@ -362,7 +406,9 @@ void PreintegrationEarthOdo::resetState(const IntegrationState &state, int num) 
     q0_ = current_state_.q;
 
     // 地球自转, 近似使用初始时刻位置
+        // iewn_ 投影参数是指地球自转角速度投影到n系的参数
     iewn_      = Earth::iewn(parameters_->station, current_state_.p);
+        // iewn_skew_ 是 iewn_的反对称矩阵
     iewn_skew_ = Rotation::skewSymmetric(iewn_);
 
     pn_.clear();

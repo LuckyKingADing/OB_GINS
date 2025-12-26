@@ -42,7 +42,12 @@ const double WGS84_E2  = 0.0067394967422764341; // 第二偏心率平方
 class Earth {
 
 public:
-    // 重力计算
+    /* ==============
+    [功能]：计算地球重力加速度
+    [in]：blh - 地理坐标（纬度、经度、高度）
+    [out]：重力加速度值
+    [公式]：g = 9.7803267715 * (1 + 0.0052790414 * sin²φ + 0.0000232718 * sin⁴φ) + h * (0.0000000043977311 * sin²φ - 0.0000030876910891) + 0.0000000000007211 * h²
+    ==============*/
     static double gravity(const Vector3d &blh) {
 
         double sin2 = sin(blh[0]);
@@ -226,10 +231,23 @@ public:
         return {0, 0, WGS84_WIE};
     }
 
+    /* ==============
+    [功能]：计算地球自转角速度在导航坐标系（n系）中的投影
+    [in]：lat - 纬度
+    [out]：Vector3d {ω_ie * cosφ, 0, -ω_ie * sinφ}
+    [公式]：ω_ie^n = [ω_ie * cosφ, 0, -ω_ie * sinφ]^T
+    ==============*/
     static Vector3d iewn(double lat) {
         return {WGS84_WIE * cos(lat), 0, -WGS84_WIE * sin(lat)};
     }
 
+    /* ==============
+    [功能]：计算地球自转角速度在导航坐标系中的投影（基于局部坐标）
+    [in]：origin - 站心坐标系原点；local - 局部坐标
+    [out]：Vector3d 地球自转角速度在n系中的投影
+    [公式]：先将局部坐标转换为全局坐标，然后使用纬度计算 ω_ie^n = [ω_ie * cosφ, 0, -ω_ie * sinφ]^T
+    ==============*/
+    // 计算iewn投影参数：是指地球自转角速度投影到n系的参数
     static Vector3d iewn(const Vector3d &origin, const Vector3d &local) {
         Vector3d global = local2global(origin, local);
 
