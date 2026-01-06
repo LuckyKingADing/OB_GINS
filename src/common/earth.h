@@ -187,13 +187,14 @@ public:
         return blh1;
     }
 
+    // 例如：global2local(station_origin, gnss.blh)
     static Vector3d global2local(const Vector3d &origin, const Vector3d &global) {
-        Vector3d ecef0 = blh2ecef(origin);
-        Matrix3d cn0e  = cne(origin);
+        Vector3d ecef0 = blh2ecef(origin); // 将站心坐标系原点的BLH转换为ECEF坐标
+        Matrix3d cn0e  = cne(origin); // 计算站心坐标系原点的Cne矩阵，即从ECEF到n系的方向余弦矩阵，n系是以站心坐标系原点为基准的局部坐标系
 
-        Vector3d ecef1 = blh2ecef(global);
+        Vector3d ecef1 = blh2ecef(global); // 将全局坐标（即当前gnss.blh）的BLH转换为ECEF坐标
 
-        return cn0e.transpose() * (ecef1 - ecef0);
+        return cn0e.transpose() * (ecef1 - ecef0); // 计算局部坐标系下的坐标，即n系坐标
     }
 
     static Pose local2global(const Vector3d &origin, const Pose &local) {

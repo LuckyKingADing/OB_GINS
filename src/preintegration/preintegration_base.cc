@@ -104,12 +104,12 @@ IMU PreintegrationBase::compensationScale(const IMU &imu) const {
 void PreintegrationBase::stateToData(const IntegrationState &state, IntegrationStateData &data) {
     data.time = state.time;
 
-    memcpy(data.pose, state.p.data(), sizeof(double) * 3);
-    memcpy(data.pose + 3, state.q.coeffs().data(), sizeof(double) * 4);
+    memcpy(data.pose, state.p.data(), sizeof(double) * 3); // 表示将state.p的数据复制到data.pose的前3个double位置
+    memcpy(data.pose + 3, state.q.coeffs().data(), sizeof(double) * 4); // 四元数的系数顺序是 (x, y, z, w)，而Eigen的Quaterniond的coeffs() 方法返回的顺序是 (w, x, y, z)，因此这里直接复制即可
 
-    memcpy(data.mix, state.v.data(), sizeof(double) * 3);
-    memcpy(data.mix + 3, state.bg.data(), sizeof(double) * 3);
-    memcpy(data.mix + 6, state.ba.data(), sizeof(double) * 3);
+    memcpy(data.mix, state.v.data(), sizeof(double) * 3); // 速度
+    memcpy(data.mix + 3, state.bg.data(), sizeof(double) * 3); // 陀螺仪偏置
+    memcpy(data.mix + 6, state.ba.data(), sizeof(double) * 3); // 加速度计偏置
 }
 
 void PreintegrationBase::stateFromData(const IntegrationStateData &data, IntegrationState &state) {

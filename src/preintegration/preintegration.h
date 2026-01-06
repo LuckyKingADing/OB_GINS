@@ -83,7 +83,7 @@ public:
             return PreintegrationOdo::stateToData(state);
         } else if (options == PREINTEGRATION_EARTH) {
             return PreintegrationEarth::stateToData(state);
-        } else if (options == PREINTEGRATION_EARTH_ODO) {
+        } else if (options == PREINTEGRATION_EARTH_ODO) { // 这里
             return PreintegrationEarthOdo::stateToData(state);
         }
         return {};

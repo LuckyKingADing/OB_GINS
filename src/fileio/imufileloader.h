@@ -33,31 +33,31 @@ public:
     ImuFileLoader(const string &filename, int columns, int rate = 200) {
         open(filename, columns, FileLoader::TEXT);
 
-        dt_ = 1.0 / (double) rate;
+        dt_ = 1.0 / (double) rate; // 预设时间间隔
 
         imu_.time = 0;
     }
 
     const IMU &next() {
-        imu_pre_ = imu_;
-
-        data_ = load();
+        imu_pre_ = imu_; // 保存上一个IMU数据
+ 
+        data_ = load(); // 读取一行数据
 
         imu_.time = data_[0];
-        memcpy(imu_.dtheta.data(), &data_[1], 3 * sizeof(double));
-        memcpy(imu_.dvel.data(), &data_[4], 3 * sizeof(double));
+        memcpy(imu_.dtheta.data(), &data_[1], 3 * sizeof(double)); // 角增量
+        memcpy(imu_.dvel.data(), &data_[4], 3 * sizeof(double)); // 速度增量
 
-        double dt = imu_.time - imu_pre_.time;
-        if (dt < 0.1) {
+        double dt = imu_.time - imu_pre_.time; // 计算时间间隔
+        if (dt < 0.1) {  // 如果时间间隔正常，则使用计算的时间间隔
             imu_.dt = dt;
-        } else {
+        } else {    // 如果时间间隔异常，则使用预设的时间间隔
             imu_.dt = dt_;
         }
 
         // 增量形式
-        if (columns_ == 8) {
+        if (columns_ == 8) { // 8列数据时，最后一列为里程计增量
             imu_.odovel = data_[7] * imu_.dt;
-        } else if (columns_ == 9) {
+        } else if (columns_ == 9) { // 9列数据时，最后两列为前后轮里程计增量，取平均值
             imu_.odovel = 0.5 * (data_[7] + data_[8]) * imu_.dt;
         }
 

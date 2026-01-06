@@ -193,7 +193,7 @@ vector<int> PreintegrationEarthOdo::numBlocksParameters() {
 IntegrationStateData PreintegrationEarthOdo::stateToData(const IntegrationState &state) {
     IntegrationStateData data;
     PreintegrationBase::stateToData(state, data);
-    data.mix[9] = state.sodo;
+    data.mix[9] = state.sodo; // 单独存储里程计尺度因子sodo
 
     return data;
 }

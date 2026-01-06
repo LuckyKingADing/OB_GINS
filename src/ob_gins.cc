@@ -161,21 +161,21 @@ int main(int argc, char *argv[]) {
     // data alignment
     IMU imu_cur, imu_pre;
     do {
-        imu_pre = imu_cur; // first imu_pre.time = 0
-        imu_cur = imufile.next(); // next()里面还有imu_pre_ = imu_
+        imu_pre = imu_cur; 
+        imu_cur = imufile.next();
     } while (imu_cur.time < starttime); // 持续读取直到imu_cur.time超过starttime
 
     GNSS gnss;
     do {
         gnss = gnssfile.next();
-    } while (gnss.time < starttime);
+    } while (gnss.time < starttime); // 持续读取直到gnss.time超过starttime
 
     // 初始位置, 求相对
     Vector3d station_origin = gnss.blh;
-    parameters->gravity     = Earth::gravity(gnss.blh);
-    gnss.blh                = Earth::global2local(station_origin, gnss.blh);
+    parameters->gravity     = Earth::gravity(gnss.blh); // gravity() 根据当前位置经纬度，计算该位置的重力加速度
+    gnss.blh                = Earth::global2local(station_origin, gnss.blh); // 将GNSS位置从大地坐标系的BLH坐标转为世界坐标系（即w系/局部坐标系）的NED坐标，即相对于站心坐标系原点的位置；可说成是导航坐标系n系，或者局部坐标系local，或者世界坐标系w系，都是一样的
 
-    // 站心坐标系原点
+    // 站心坐标系原点：即最开始的时间戳所在的gnss位置
     parameters->station = station_origin;
 
     std::vector<IntegrationState> statelist(windows + 1);
@@ -189,27 +189,27 @@ int main(int argc, char *argv[]) {
     // 初始状态
     // initialization
     IntegrationState state_curr = {
-        .time = round(gnss.time),
-        .p    = gnss.blh - Rotation::euler2quaternion(initatt) * antlever,
-        .q    = Rotation::euler2quaternion(initatt),
-        .v    = initvel,
-        .bg   = initbg,
-        .ba   = initba,
-        .sodo = 0.0,
-        .abv  = {bodyangle[1], bodyangle[2]},
+        .time = round(gnss.time), // 取整秒
+        .p    = gnss.blh - Rotation::euler2quaternion(initatt) * antlever, // 初始位置，改正GNSS天线和IMU之间的杆臂，得到w系下的IMU初始位置
+        .q    = Rotation::euler2quaternion(initatt),                        // 初始姿态，将初始欧拉角转换为四元数                  
+        .v    = initvel, // 初始速度，配置文件读取，n系下速度
+        .bg   = initbg,  // 初始陀螺仪偏置
+        .ba   = initba,  // 初始加速度计偏置
+        .sodo = 0.0,     // 
+        .abv  = {bodyangle[1], bodyangle[2]},  // bodyangle是IMU到载体的旋转角 (mouting angles to construct C_b^v)，这里存储的是y轴和z轴的安装角，俯仰角和横滚角， v系是载体坐标系， b系是IMU坐标系，载体坐标系中心点在哪？？？
     };
     std::cout << "Initilization at " << gnss.time << " s " << std::endl;
 
-    statelist[0]     = state_curr;
-    statedatalist[0] = Preintegration::stateToData(state_curr, preintegration_options);
-    gnsslist.push_back(gnss);
+    statelist[0]     = state_curr; // 初始状态存入状态列表
+    statedatalist[0] = Preintegration::stateToData(state_curr, preintegration_options); // 初始状态转换为数据格式存入状态数据列表，因为ceres求解时使用的是数据格式，即double格式，而不是状态向量格式，vector3d和quaterniond格式
+    gnsslist.push_back(gnss); // 初始GNSS存入GNSS列表
 
-    double sow = round(gnss.time);
-    timelist.push_back(sow);
+    double sow = round(gnss.time); // sow: start of week，当前积分周期的起始时间，取整秒
+    timelist.push_back(sow);       // 时间列表，存入当前积分周期起始时间
 
     // 初始预积分
     // Initial preintegration
-    preintegrationlist.emplace_back(
+    preintegrationlist.emplace_back( // 在预积分列表末尾添加一个新的预积分对象
         Preintegration::createPreintegration(parameters, imu_pre, state_curr, preintegration_options));
 
     // 读取下一个整秒GNSS

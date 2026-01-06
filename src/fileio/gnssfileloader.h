@@ -36,16 +36,16 @@ public:
     }
 
     const GNSS &next() {
-        data_ = load();
+        data_ = load(); // load()表示读取一行数据
 
         gnss_.time = data_[0];
-        memcpy(gnss_.blh.data(), &data_[1], 3 * sizeof(double));
+        memcpy(gnss_.blh.data(), &data_[1], 3 * sizeof(double)); // 从data_的第1个元素开始拷贝3个double到gnss_.blh，表示纬度、经度、高度
 
-        // 13列GNSS文件包含GNSS速度
+        // 13列GNSS文件包含GNSS速度；7列GNSS文件不包含GNSS速度
         if (data_.size() == 7) {
-            memcpy(gnss_.std.data(), &data_[4], 3 * sizeof(double));
+            memcpy(gnss_.std.data(), &data_[4], 3 * sizeof(double)); // 从data_的第4个元素开始拷贝3个double到gnss_.std
         } else {
-            memcpy(gnss_.std.data(), &data_[7], 3 * sizeof(double));
+            memcpy(gnss_.std.data(), &data_[7], 3 * sizeof(double)); // 从data_的第7个元素开始拷贝3个double到gnss_.std，因为前面有速度信息
         }
         gnss_.blh[0] *= D2R;
         gnss_.blh[1] *= D2R;

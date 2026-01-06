@@ -207,3 +207,6 @@ isearth: true   # 启用地球自转补偿
 - 地球自转计算：`src/common/earth.h` - `iewn()` 函数
 - 连续状态积分：`src/preintegration/preintegration_earth.cc:218-260`
 - 预积分补偿：`src/preintegration/preintegration_earth_odo.cc:250-284`
+
+
+ 初始状态转换为数据格式存入状态数据列表，因为ceres求解时使用的是数据格式，即double格式，而不是状态向量格式，vector3d和quaterniond格式
