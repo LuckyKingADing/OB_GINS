@@ -8,9 +8,9 @@ outputpath: "dataset/"
 
 # 时间信息, s
 # Processing time parameters
-windows: 30
-starttime: 357473
-endtime: 359090
+windows: 30         # 滑动窗口大小 (sliding window size), s
+starttime: 357473   # 起始时间 (start time), s
+endtime: 359090     # 结束时间 (end time), s
 
 # 迭代次数
 # number of iterations
@@ -32,22 +32,22 @@ initab: [ 0, 0, 0 ]  # 初始加表零偏 (accelerometer biases), mGal
 
 # IMU文件数据列数 (7-imu only, 8-with odometer)
 # IMU data file columns
-imudatalen: 8
+imudatalen: 8      # 7表示仅IMU数据, 8表示包含里程计odo数据 
 # IMU原始数据频率, Hz
 # IMU data rate
-imudatarate: 200
+imudatarate: 200   # 1s包含200个IMU数据
 
 # 考虑地球自转补偿项
 # consider the Earth's rotation
 isearth: true
 
-# 安装参数
+# 安装参数，基准点为IMU中心
 # Installation parameters
 antlever: [ -0.073, 0.302, 0.087 ]  # 天线杆臂 (antenna lever), IMU前右下方向, m
 odolever: [ -0.64, -0.628, 2.122 ]  # 里程计杆臂 (odometer lever), IMU前右下方向, m
 bodyangle: [ 0, -0.30, -1.09 ]       # IMU到载体的旋转角 (mouting angles to construct C_b^v), deg
 
-odometer:
+odometer: 
     isuseodo: true              # use odometer
 
     std: [ 0.05, 0.05, 0.05 ]   # 里程标准差 (vehicle velocity standard deviation), m/s
@@ -56,19 +56,19 @@ odometer:
 # IMU噪声建模参数
 # IMU noise parameters
 imumodel:
-    arw: 0.1     # deg/sqrt(hr)
-    vrw: 0.1     # m/s/sqrt(hr)
-    gbstd: 25.0   # deg/hr
-    abstd: 200.0  # mGal
-    corrtime: 1.0 # hr
+    arw: 0.1     # deg/sqrt(hr) ，角速度随机游走 (angular random walk)
+    vrw: 0.1     # m/s/sqrt(hr) ，速度随机游走 (velocity random walk)
+    gbstd: 25.0   # deg/hr， 陀螺零偏稳定度 (gyroscope bias stability)
+    abstd: 200.0  # mGal， 加表零偏稳定度 (accelerometer bias stability)
+    corrtime: 1.0 # hr， 零偏相关时间常数 (bias correlation time)
 
 # GNSS仿真中断配置
 # GNSS outage parameters
-isuseoutage: true
-outagetime: 357900
-outagelen: 60
-outageperiod: 150
+isuseoutage: true     # 是否进行GNSS中断仿真 (simulate GNSS outage)
+outagetime: 357900    # 中断开始时间 (outage start time), s
+outagelen: 60         # 中断持续时间 (outage duration), s
+outageperiod: 150      # 中断周期 (outage period), s
 
-# 固定阈值GNSS抗差 (m)
+# 固定阈值GNSS抗差 (m)，基于定位标准差std
 # a fixed threshold for GNSS outlier-culling using positioning standard deviation
 gnssthreshold: 0.2

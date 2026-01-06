@@ -112,11 +112,12 @@ int main(int argc, char *argv[]) {
     // consider the Earth's rotation
     bool isearth = config["isearth"].as<bool>();
 
+    // 创建文件对象
     GnssFileLoader gnssfile(gnsspath);
     ImuFileLoader imufile(imupath, imudatalen, imudatarate);
-    FileSaver navfile(outputpath + "/OB_GINS_TXT.nav", 11, FileSaver::TEXT);
-    FileSaver errfile(outputpath + "/OB_GINS_IMU_ERR.bin", 7, FileSaver::BINARY);
-    if (!imufile.isOpen() || !navfile.isOpen() || !navfile.isOpen() || !errfile.isOpen()) {
+    FileSaver navfile(outputpath + "/OB_GINS_TXT.nav", 11, FileSaver::TEXT);      // 导航结果文件，文本格式
+    FileSaver errfile(outputpath + "/OB_GINS_IMU_ERR.bin", 7, FileSaver::BINARY); // IMU误差文件，二进制格式
+    if (!imufile.isOpen() || !gnssfile.isOpen() || !navfile.isOpen() || !errfile.isOpen()) {
         std::cout << "Failed to open data file" << std::endl;
         return -1;
     }
@@ -129,7 +130,7 @@ int main(int argc, char *argv[]) {
     Vector3d odolever(vec.data());
     vec = config["bodyangle"].as<std::vector<double>>();
     Vector3d bodyangle(vec.data());
-    bodyangle *= D2R;
+    bodyangle *= D2R; // rad
 
     // IMU噪声参数
     // IMU noise parameters
@@ -160,9 +161,9 @@ int main(int argc, char *argv[]) {
     // data alignment
     IMU imu_cur, imu_pre;
     do {
-        imu_pre = imu_cur;
-        imu_cur = imufile.next();
-    } while (imu_cur.time < starttime);
+        imu_pre = imu_cur; // first imu_pre.time = 0
+        imu_cur = imufile.next(); // next()里面还有imu_pre_ = imu_
+    } while (imu_cur.time < starttime); // 持续读取直到imu_cur.time超过starttime
 
     GNSS gnss;
     do {
