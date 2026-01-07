@@ -27,13 +27,15 @@ PreintegrationEarthOdo::PreintegrationEarthOdo(std::shared_ptr<IntegrationParame
                                                IntegrationState state)
     : PreintegrationBase(std::move(parameters), imu0, std::move(state)) {
 
-    // Reset state
+    // 初始化delta_state_、jacobian_、covariance_
+    // Reset state 
     resetState(current_state_, NUM_STATE);
 
+    // 设置初始噪声矩阵：包括从配置文件读取后赋值在parameters_中的噪声参数，包括：随机游走噪声、零偏噪声等
     // Set initial noise matrix
     setNoiseMatrix();
 
-    // 里程计参数
+    // 里程计参数：从配置参数中读取安装角和杆臂
     cvb_  = Rotation::euler2matrix(parameters_->abv).transpose();
     lodo_ = parameters_->lodo;
 }
@@ -227,69 +229,86 @@ void PreintegrationEarthOdo::constructState(const double *const *parameters, Int
     };
 }
 
+/* IMU 预积分 */
 void PreintegrationEarthOdo::integrationProcess(unsigned long index) {
+    // 零偏补偿
     IMU imu_pre = compensationBias(imu_buffer_[index - 1]);
     IMU imu_cur = compensationBias(imu_buffer_[index]);
 
     // 区间时间累积
     double dt = imu_cur.dt;
-    delta_time_ += dt;
+    delta_time_ += dt; // 累积时间间隔
 
-    end_time_           = imu_cur.time;
-    current_state_.time = imu_cur.time;
+    end_time_           = imu_cur.time; // 更新结束时间为当前IMU数据的时间戳
+    current_state_.time = imu_cur.time; // 更新当前状态的时间戳
 
-    // 1.连续状态积分(机械编排), 先位置速度再姿态
+    // 1.连续状态积分(INS惯导解算：机械编排), 先位置速度再姿态
 
     // 位置速度
 
     // 速度：“Ref：KF-GINS github项目中docs文件夹内的《kf-gins开源代码分享-i2nav-0514.pdf》”
+        /* 采用双子样假设，根据上一时刻的速度、上一时刻和当前时刻的IMU观测值，计算n系下当前时刻k的速度，包括比力积分项、重力和哥氏积分项。 
+            1.考虑旋转效应、划桨效应，计算b系下比力积分项。
+            2.根据投影参数、重力、上一时刻的速度，计算重力和哥氏积分项。
+            3.根据投影参数、上一时刻的姿态，由b系比力积分项，得到n系下比力积分项*/
     // b系比力积分项：dvfb
     Vector3d dvfb = imu_cur.dvel + 0.5 * imu_cur.dtheta.cross(imu_cur.dvel) +
                     1.0 / 12.0 * (imu_pre.dtheta.cross(imu_cur.dvel) + imu_pre.dvel.cross(imu_cur.dtheta));
-    // 哥氏项和重力项
+    // 哥氏项和重力项：iewn_是地球自转角速度在n系下的投影；current_state_.v表示n系下上一时刻的速度，k-1時刻
     Vector3d dv_cor_g = (gravity_ - 2.0 * iewn_.cross(current_state_.v)) * dt;
 
-    // 地球自转补偿项, 省去了enwn项
+    // !!!地球自转补偿项, 省去了enwn项，（可以考虑加上)
         /* 在计算地球自转补偿项时，使用的投影参数是指地球自转角速度投影到n系的参数iewn_ ，
             但是忽略了n系相对于e系转动角速度投影到n系的补偿项，而KF-GINS都考虑了 */
     Vector3d dnn    = -iewn_ * dt;
-    Quaterniond qnn = Rotation::rotvec2quaternion(dnn);
+    Quaterniond qnn = Rotation::rotvec2quaternion(dnn); // 旋转向量转换为四元数，表示n系下k-1时刻到k时刻的旋转四元数
 
-    Vector3d dvel =
+    Vector3d dvel = 
+        // 首尾平均法，和公式中的 中点法 效果一样
         0.5 * (Matrix3d::Identity() + qnn.toRotationMatrix()) * current_state_.q.toRotationMatrix() * dvfb + dv_cor_g;
 
-    current_state_.v += dvel;
+    current_state_.v += dvel; // 更新速度
 
     // 位置
     // 前后历元平均速度计算位置
+    // PS：KF-GINS在进行位置更新时，计算的是大地坐标系下的BLH坐标，所以和OB-GINS不一样。
     current_state_.p += dt * current_state_.v + 0.5 * dt * dvel;
-    
 
     // 缓存IMU时刻位置, 时间间隔为两个历元的间隔
     pn_.emplace_back(std::make_pair(dt, current_state_.p));
 
-    // 姿态：Ref：KF-GINS github项目中docs文件夹内的《kf-gins开源代码分享-i2nav-0514.pdf》
+    // 姿态
+    // Ref：KF-GINS github项目中docs文件夹内的《kf-gins开源代码分享-i2nav-0514.pdf》
+        /*  采用四元数进行姿态更新计算：
+            根据投影参数，计算k-1时刻~k时刻n系下的旋转四元数
+            基于双子样假设，根据IMU角度增量数据，计算k-1时刻~k时刻b系下的旋转四元数
+            根据k-1时刻的四元数 ，计算k时刻的四元数 */
     Vector3d dtheta = imu_cur.dtheta + 1.0 / 12.0 * imu_pre.dtheta.cross(imu_cur.dtheta);
-
+        // Rotation::rotvec2quaternion(dtheta)表示b系下k-1时刻到k时刻的旋转四元数
+        // current_state_.q表示k-1时刻的四元数
+        // qnn表示n系下k-1时刻到k时刻的旋转四元数
+        // 最后得到current_state_.q表示k时刻的四元数
     current_state_.q = qnn * current_state_.q * Rotation::rotvec2quaternion(dtheta);
     current_state_.q.normalize();
 
-    // 2.预积分：利用相邻节点之间的 IMU 数据预先积分出与积分起点位姿无关的相对位置、速度、姿态增量。
+    /* PS: 相比于KF-GINS，OB_GINS并没有计算中间时刻的速度、位置，更新投影参数，应该还是因为面向的惯导类型不同，OB_GINS面向的惯导是MEMS，可以简略一些步骤，而KF-GINS面向的惯导是高精度的。*/
+
+    // 2.预积分（相对状态约束）：利用相邻节点之间的 IMU 数据预先积分出与积分起点位姿无关的相对位置、速度、姿态增量。
         // 具体概念，详见武汉大学i2nav团队常乐的博士论文第2章的2.4小节。
 
     // (1) ODO预积分:直接使用ODO测量的原始里程信息，积分得到里程增量。
-    // 中间时刻的地球自转等效旋转矢量
+    // 中间时刻的地球自转等效旋转矢量：根据投影参数iewn_、相对姿态delta_state_.q，计算中间时刻的地球自转等效旋转矢量 
         // Ref：i2nav团队唐海亮博士在IEEE发表的论文《Impact of the Earth Rotation Compensation on MEMS-IMU Preintegration of Factor Graph Optimization》 -- 公式11 
-    dnn           = -(delta_time_ - 0.5 * dt) * iewn_;  // dnn: 从积分起点到当前时刻中间点的地球自转旋转矢量，dnn = - (Δt - 0.5*dt) * ω_ie^n
-    Matrix3d cbbe = (q0_.inverse() * Rotation::rotvec2quaternion(dnn) * q0_ * delta_state_.q).toRotationMatrix();  // cbbe: 补偿地球自转的旋转矩阵，C_b^b_e = q0^{-1} * exp(dnn) * q0 * Δq
+    dnn           = -(delta_time_ - 0.5 * dt) * iewn_;  // dnn: 从积分起点到当前时刻中间点的地球自转旋转矢量，dnn = - (Δt - 0.5*dt) * ω_ie^n；消除地球自转对惯性系假设的影响
+    Matrix3d cbbe = (q0_.inverse() * Rotation::rotvec2quaternion(dnn) * q0_ * delta_state_.q).toRotationMatrix();  // cbbe: 补偿地球自转的旋转矩阵，C_b^b_e = q0^{-1} * exp(dnn) * q0 * Δq，其中 q0 是积分起点时刻的姿态四元数，Δq 是预积分的姿态增量，表示从积分起点到当前时刻的相对姿态变化，cbbe：最终得到的矩阵，表示考虑了地球自转修正后的，从当前b系到初始b0系的旋转矩阵（将b系转换到w系(即b_e(k-1)系)下的旋转矩阵）
 
-    // 里程增量：根据里程计比例因子、杆臂lodo_ ，计算里程增量，更新delta_state_.s
+    // 里程增量：根据里程计比例因子、杆臂lodo_ ，计算里程增量delta_state_.s，更新delta_state_.s
         // Ref：《基于图优化的LiDAR/INS/ODO/GNSS车载组合导航算法研究》-武汉大学博士论文-常乐-公式(5.6)
-    Vector3d dsodo = Vector3d(imu_cur.odovel, 0, 0);  // dsodo: 里程计原始测量向量，dsodo = [odovel, 0, 0]^T，其中 odovel 是里程计速度测量，通常是前进速度
+    Vector3d dsodo = Vector3d(imu_cur.odovel, 0, 0);  // dsodo: 里程计原始测量向量，dsodo = [odovel, 0, 0]^T，其中 odovel 是里程计速度测量，通常是前进速度，即x轴，前右下对应xyz
     delta_state_.s += cbbe * (cvb_ * dsodo * (1 + delta_state_.sodo)
-                            - Rotation::rotvec2quaternion(imu_cur.dtheta).toRotationMatrix() * lodo_ + lodo_);
+                            - Rotation::rotvec2quaternion(imu_cur.dtheta).toRotationMatrix() * lodo_ + lodo_); // cvb_: 车体坐标系到ODO安装坐标系的旋转矩阵（根据参数配置中的安装角计算得到），lodo_: 里程计安装位置的杆臂向量
 
-    /* PS：以上ODO预积分公式涉及两个坐标系，v系和w系：
+    /* PS：以上ODO预积分公式涉及两个坐标系，v系和w系： v系是车辆坐标系，w系是惯导坐标系。
            v系是以ODO安装所在车轮与地面的切点为原点。
            w系的原点不变，一直在初始位置，固定在k-1时刻的e系下。*/
 
@@ -298,7 +317,7 @@ void PreintegrationEarthOdo::integrationProcess(unsigned long index) {
         // 位置预积分：和之前位置更新的原理相同，不过得到的应该是w系下的位置。
         // Ref：《Impact of the Earth Rotation Compensation on MEMS-IMU Preintegration of Factor Graph Optimization》-公式10
     // 前后历元平均速度计算位置
-    dvel = cbbe * dvfb; 
+    dvel = cbbe * dvfb; // cbbe: 补偿地球自转的旋转矩阵，C_b^b_e，将b系下的比力积分项dvfb转为w系下
     delta_state_.p += dt * delta_state_.v + 0.5 * dt * dvel;
     delta_state_.v += dvel;
 
@@ -308,7 +327,7 @@ void PreintegrationEarthOdo::integrationProcess(unsigned long index) {
     delta_state_.q *= Rotation::rotvec2quaternion(dtheta);
     delta_state_.q.normalize();
 
-    // 更新系统状态雅克比和协方差矩阵
+    // 3.更新系统状态雅克比和协方差矩阵
     updateJacobianAndCovariance(imu_pre, imu_cur);
 }
 
@@ -319,12 +338,56 @@ void PreintegrationEarthOdo::resetState(const IntegrationState &state) {
 /* 误差传播函数：根据误差传播定律，建立误差微分方程，更新雅可比矩阵和协方差矩阵。
     Ref：《Impact of the Earth Rotation Compensation on MEMS-IMU Preintegration of Factor Graph Optimization》-公式14~25
 
-    计算状态转移矩阵Phi（19行*19列）。
-    计算噪声驱动矩阵G（19行*16列）。
-    计算噪声矩阵Q（19行*19列）。
-    更新雅可比矩阵J（19行*19列）。
-    更新参数协方差矩阵
-    （19行*19列）
+    总览：
+    1.计算状态转移矩阵Phi（19行*19列）。
+    2.计算噪声驱动矩阵G（19行*16列）。
+    3.计算噪声矩阵Q（19行*19列）。
+    4.更新雅可比矩阵J（19行*19列）。
+    5.更新参数协方差矩阵Pk（19行*19列）
+
+    误差传播方程 (线性化):
+    delta_x_{k+1} = Phi_k * delta_x_k + G_k * n_k
+    jacobian_ = phi * jacobian_;  // jacobian_实际上是 当前时刻误差 关于 初始时刻误差 的偏导数,表示：如果在预积分起点的状态（比如零偏 bg, ba）发生微小变化，当前时刻的预积分结果会发如何变化,利用该公式的递推关系，一步步累积计算出了相对于初始状态的灵敏度矩阵。这个矩阵最后在 evaluate 函数中被用来做一阶泰勒展开，修正预积分结果
+
+    公式总结：
+    1. 状态向量 (19维):
+       delta_x = [dp(3), dv(3), dtheta(3), dbg(3), dba(3), ds(3), ds_odo(1)]^T
+         dp, dv, dtheta: IMU预积分位置、速度、姿态误差
+         dbg, dba: 陀螺仪、加速度计零偏误差
+         ds: 里程计位置增量误差 (w系下)
+         ds_odo: 里程计比例因子误差
+
+    2. 状态转移矩阵 Phi (19x19):
+       Phi = [ I    I*dt   0               0              0              0                0          ]
+             [ 0    I      C*Sk(dv)        0              C*dt           0                0          ]
+             [ 0    0      I-Sk(dtheta)   -I*dt           0              0                0          ]
+             [ 0    0      0               I*(1-dt/tau)   0              0                0          ]
+             [ 0    0      0               0              I*(1-dt/tau)   0                0          ]
+             [ 0    0      C*Sk(stheta)    C*Sk(l)*dt     0              I            -C*cvb*dsodo ]
+             [ 0    0      0               0              0              0                1          ]
+       其中:
+         C = C_b^b0 (当前时刻b系到初始b0系的旋转矩阵，代码中为 cbb0)
+         Sk(.) 为反对称矩阵
+         stheta = cvb * dsodo * (1+sodo) - dtheta x lodo
+         dsodo = [odo_vel, 0, 0]^T
+
+    3. 噪声驱动矩阵 G (19x16):
+       G = [ 0     0     0     0     0     0]
+           [ 0     C     0     0     0     0]  <- v 对应 acc噪声
+           [-I     0     0     0     0     0]  <- theta 对应 gyr噪声
+           [ 0     0     I     0     0     0]  <- bg 对应 bg噪声
+           [ 0     0     0     I     0     0]  <- ba 对应 ba噪声
+           [ G_sg  0     0     0     G_so  0]  <- s 对应 gyr噪声(杆臂效应) 和 odo噪声
+           [ 0     0     0     0     0     1]  <- sodo 对应 sodo噪声
+       其中:
+         G_sg = C * Sk(lodo)
+         G_so = C * cvb * (1+sodo)
+
+    4. 传播公式:
+       Jacobian: J_k = Phi_k * J_{k-1}
+       Covariance: P_k = Phi_k * P_{k-1} * Phi_k^T + Q_k
+       Discrete Noise Q_k: 中值积分近似 (Trapezoidal integration)
+         Q_k = 0.5 * dt * (Phi * G * Q * G^T + G * Q * G^T * Phi^T)
 
     PS：
     雅可比矩阵不是EKF中提及的系数矩阵，系数矩阵是常数矩阵，而雅可比矩阵是包含参数的矩阵，是关于参数的一阶偏导数，会随着参数变化而变化。因此，参数更新后，雅可比矩阵也需要更新。
@@ -345,29 +408,13 @@ void PreintegrationEarthOdo::updateJacobianAndCovariance(const IMU &imu_pre, con
 
     double dt = imu_cur.dt; // 时间间隔
 
-    // 表示这“当前时刻/末端”的等效旋转（整体区间的累计旋转）
-    Vector3d dnn  = -iewn_ * delta_time_; 
-    Matrix3d cbb0 = -(q0_.inverse() * Rotation::rotvec2quaternion(dnn) * q0_ * delta_state_.q).toRotationMatrix();
+    // 整体区间的累计旋转cbb0
+    Vector3d dnn  = -iewn_ * delta_time_;  // dnn: 从积分起点到当前时刻的地球自转旋转矢量，dnn = - Δt * ω_ie^n；消除地球自转对惯性系假设的影响;delta_time_ 表示 从预积分起始时刻到当前时刻的累计时间长度,
+    Matrix3d cbb0 = -(q0_.inverse() * Rotation::rotvec2quaternion(dnn) * q0_ * delta_state_.q).toRotationMatrix(); // C_b^b0: 从当前b系到初始b0系的旋转矩阵（将b系转换到w系(即b_e(k-1)系)下的旋转矩阵）
 
-    // jacobian
+    // 1.jacobian
 
-    // phi = I + F * dt   计算状态转移矩阵Phi（19行*19列）。
-    // 矩阵按块划分，状态顺序为：p(3), v(3), q(3), bg(3), ba(3), s(3), sodo(1)
-    // 以 7x7 块矩阵表示（每个块为对应维度）：
-    // Phi = [  I        I*dt      0                  0                 0                    0                         0  ]
-    //       [  0        I         C_b^b0*Sk(dv)      0         C_b^b0*dt        C_b^b0*Sk(stheta)    -C_b^b0*cvb*dsodo ]
-    //       [  0        0         I - Sk(dtheta)    -I*dt              0                    0                         0  ]
-    //       [  0        0            0          I*(1-dt/tau)          0                    0                         0  ]
-    //       [  0        0            0               0          I*(1-dt/tau)            0                         0  ]
-    //       [  0        0            0               0               0                 I                         0  ]
-    //       [  0        0            0               0               0                 0                         1  ]
-    // 其中：
-    //  - C_b^b0 = cbb0
-    //  - Sk(x) 表示向量 x 对应的反对称矩阵 Rotation::skewSymmetric(x)
-    //  - dv 对应代码中的 imu_cur.dvel，dtheta 对应 imu_cur.dtheta
-    //  - stheta = cvb_ * [odovel,0,0]^T * (1 + delta_state_.sodo) - imu_cur.dtheta.cross(lodo_)
-    //  - dsodo = [imu_cur.odovel, 0, 0]^T
-    // 注：上面每个块的维度需按状态维数展开为具体的 3x3 或 3x1 子矩阵。
+    // phi = I + F * dt   计算状态转移矩阵Phi（19行*19列）。phi的具体构建应该看教材或者官方文档
     phi.block<3, 3>(0, 0)   = Matrix3d::Identity();
     phi.block<3, 3>(0, 3)   = Matrix3d::Identity() * dt;
     phi.block<3, 3>(3, 3)   = Matrix3d::Identity();
@@ -387,12 +434,12 @@ void PreintegrationEarthOdo::updateJacobianAndCovariance(const IMU &imu_pre, con
     phi.block<3, 1>(15, 18) = -cbb0 * cvb_ * dsodo;
     phi(18, 18)             = 1.0;
 
-    // 更新雅克比矩阵
-    jacobian_ = phi * jacobian_;
+    // 更新雅克比矩阵，公式：Jk = phi * Jk-1，递推
+    jacobian_ = phi * jacobian_; 
 
-    // covariance
+    // 2.covariance
 
-    // gt 计算噪声驱动矩阵G（19行*16列）
+    // gt 计算噪声驱动矩阵G（19行*16列）    
     Eigen::MatrixXd gt = Eigen::MatrixXd::Zero(NUM_STATE, NUM_NOISE);
 
     gt.block<3, 3>(3, 3)   = cbb0;
@@ -403,16 +450,17 @@ void PreintegrationEarthOdo::updateJacobianAndCovariance(const IMU &imu_pre, con
     gt.block<3, 3>(15, 12) = cbb0 * cvb_ * (1 + delta_state_.sodo);
     gt(18, 15)             = 1.0;
 
-    // 计算噪声矩阵Q（19行*19列）
+    // 计算噪声矩阵Q（19行*19列），公式：Qk = 0.5 * dt * (phi * gt * noise_ * gt.transpose() + gt * noise_ * gt.transpose() * phi.transpose())  ，近似等于
     Eigen::MatrixXd Qk =
         0.5 * dt * (phi * gt * noise_ * gt.transpose() + gt * noise_ * gt.transpose() * phi.transpose());
 
-    // 更新参数协方差矩阵 （19行*19列）
+    // 更新参数协方差矩阵 （19行*19列），公式：Pk = phi * Pk * phi.transpose() + Qk
     covariance_ = phi * covariance_ * phi.transpose() + Qk;
 }
 
 /* 初始预积分delta_state_状态变量设置 */
 void PreintegrationEarthOdo::resetState(const IntegrationState &state, int num) {
+    // 初始化预积分状态
     delta_time_ = 0;
     delta_state_.p.setZero();
     delta_state_.q.setIdentity();
@@ -422,7 +470,7 @@ void PreintegrationEarthOdo::resetState(const IntegrationState &state, int num) 
     delta_state_.ba   = state.ba;
     delta_state_.sodo = state.sodo;
 
-    jacobian_.setIdentity(num, num);
+    jacobian_.setIdentity(num, num); //
     covariance_.setZero(num, num);
 
     // 预积分起点的绝对姿态

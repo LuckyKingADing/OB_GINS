@@ -323,3 +323,155 @@ writeNavResult(..., integration->currentState(), ...);
 
 
 
+ PS：相比于KF-GINS，OB_GINS并没有计算中间时刻的速度、位置，更新投影参数，应该还是因为面向的惯导类型不同，OB_GINS面向的惯导是MEMS，可以简略一些步骤，而KF-GINS面向的惯导是高精度的。
+
+在预积分时， ODO预积分公式涉及两个坐标系，v系和w系：
+v系： vehicle车辆坐标系
+w：world世界坐标系，imu坐标系
+           v系是以ODO安装所在车轮与地面的切点为原点。
+           w系的原点不变，一直在初始位置，固定在k-1时刻的e系下。
+
+### 8. 预积分中的坐标系与核心公式解析
+
+#### **核心思想**
+预积分的目的是将一连串的 IMU/ODO 测量值，压缩成相对于**“积分起点时刻（$k-1$）”**的增量。所有的测量值（加速度、角速度、里程计速度）都需要投影到同一个参考系下才能进行累加。
+
+#### **两个关键坐标系**
+1. **v系 (Vehicle/Odometer Frame)**
+   - **定义**：里程计安装位置所在的坐标系。
+   - **原点**：车轮与地面的接触点。
+   - **用途**：里程计原始读数（前进速度）是在这个坐标系下的。
+
+2. **w系 / b_start系 (World/Inertial Frame)**
+   - **定义**：**固定在积分起点时刻（$k-1$时刻）的载体坐标系**。
+   - **特性**：它是一个**惯性系**。这意味着在物理空间中，它是“冻结”的，不随地球自转而转动。
+   - **几何关系**：在 $k-1$ 时刻，它与当时的载体坐标系重合；随着时间推移，载体动了，地球也转了，但这个系保持惯性不动。
+
+#### **关键代码解析**
+
+```cpp
+// 1. 计算地球自转引起的旋转矢量 (n系下)
+dnn = -(delta_time_ - 0.5 * dt) * iewn_;
+
+// 2. 构建核心投影矩阵 cbbe (Current Body -> Start Body)
+Matrix3d cbbe = (q0_.inverse() * Rotation::rotvec2quaternion(dnn) * q0_ * delta_state_.q).toRotationMatrix();
+```
+
+**`dnn` 的含义**：
+- 计算从积分起点到当前中间时刻，地球自转导致的角度变化。
+- 负号表示这是一个补偿项（逆向旋转），目的是消除地球自转的影响，维持惯性系的假设。
+
+**`cbbe` ($C_{b_{start}}^{b_{current}}$) 的含义**：
+- 这是一个**从当前载体坐标系到积分起点惯性系**的旋转矩阵。
+- **公式拆解**：
+  $$ \mathbf{C}_{final} = (\mathbf{q}_{nb_0}^{-1} \cdot \mathbf{q}_{earth} \cdot \mathbf{q}_{nb_0}) \cdot \Delta \mathbf{q}_{gyro} $$
+  - `delta_state_.q`: 纯陀螺仪积分得到的相对旋转。
+  - `q0_inv * dnn * q0`: 将地球自转补偿量从 **n系** 变换到 **b_start系**。
+- **作用**：将当前时刻测得的物理量（如加速度 `dvfb`、里程计速度 `dsodo`）投影回**b_start系**进行累加。
+
+#### **预积分累加过程**
+
+**1. ODO 预积分**
+```cpp
+// 修正杆臂效应 + 投影回 b_start 系
+delta_state_.s += cbbe * (cvb_ * dsodo * (1 + sodo) + lever_arm_comp);
+```
+- 先把里程计速度 `dsodo` 转到 IMU 系 (`cvb_`)。
+- 加上杆臂效应修正（`lever_arm_comp`）。
+- 最后乘上 `cbbe`，统一投影到起点系累加。
+
+**2. INS 速度预积分**
+```cpp
+dvel = cbbe * dvfb; 
+delta_state_.v += dvel; // 这里的 v 是在 b_start 系下的速度增量
+```
+- `dvfb`: 当前 IMU 系下的比力积分（速度增量）。
+- `cbbe`: 投影到起点系。
+
+### 9. 预积分结果 (delta_state_) 的含义与作用
+
+#### **delta_state_ 中的 PVQ 是什么？**
+
+`delta_state_` 结构体存储了从 **预积分起始时刻 ($k-1$)** 到 **当前时刻 ($k$)** 的**相对状态增量**。
+
+- **`delta_state_.p` (相对位移)**
+  - 不是物理空间的两点距离，而是在 **$b_{start}$ (w) 系** 下累积的位移增量。
+  - 物理含义：假设初始速度为0、位置为0，纯粹由加速度计推算出的位移。
+  - 核心公式项：$\sum [\mathbf{v}_t \Delta t + \frac{1}{2} \mathbf{a}_t \Delta t^2]$
+
+- **`delta_state_.v` (相对速度增量)**
+  - 在 **$b_{start}$ (w) 系** 下的速度变化量。
+  - 物理含义：纯惯性测量带来的速度改变。
+  - 核心公式项：$\sum \mathbf{a}_t \Delta t$
+
+- **`delta_state_.q` (相对旋转)**
+  - 从 **$b_{start}$ (w) 系** 到 **$b_{current}$ 系** 的旋转四元数。
+  - 物理含义：这段时间内陀螺仪积分得到的总旋转量（已剔除地球自转）。
+
+#### **预积分结果如何使用？**
+
+预积分的目的是构建 **优化因子 (Factor)**，充当非线性优化中的 **“测量约束”**。
+
+在 `evaluate` 函数中，系统通过计算 **残差 (Residuals)** 引导优化：
+
+> **残差 = 状态变量推算出的增量 - 预积分测得的增量**
+
+**1. 位置残差**
+```cpp
+// 理论相对位移 (考虑了初始速度、重力影响，并转到 b_start 系)
+Vector3d theory_dp = cnb0 * (p_j - p_i - v_i * dt - 0.5 * g * dt * dt);
+// 残差
+residual_p = theory_dp - delta_state_.p;
+```
+
+**2. 速度残差**
+```cpp
+// 理论相对速度变化
+Vector3d theory_dv = cnb0 * (v_j - v_i - g * dt);
+// 残差
+residual_v = theory_dv - delta_state_.v;
+```
+
+**3. 总结**
+- `delta_state_` 把成百上千次高频 IMU 数据压缩成了一个 **虚拟测量值**。
+- 它充当了 **“尺子”**：告诉优化器，$i$ 时刻到 $j$ 时刻，物体根据惯性计“应该”发生了多大的相对运动。
+- 优化器调整全局状态 ($p, v, q, bg, ba$)，使得所有时刻的相对运动都尽可能符合这把“尺子”的度量。
+
+### 10. 误差传播函数 (updateJacobianAndCovariance) 解析
+
+该函数核心作用是 **递推更新系统状态误差的雅可比矩阵（Jacobian）和协方差矩阵（Covariance）**。
+
+#### **背景**
+在后端优化时，我们需要回答两个问题：
+1. **Result Correction**: 如果零偏 bias 被微调了，预积分结果需要改变量是多少？（需要 Jacobian）
+2. **Weighting**: 这次预积分结果的可信度是多少？（需要 Covariance）
+
+#### **核心原理**
+基于线性化的误差传播离散方程：
+$$ \delta \mathbf{x}_{k} \approx \boldsymbol{\Phi}_{k, k-1} \delta \mathbf{x}_{k-1} + \mathbf{G}_{k-1} \mathbf{n}_{k-1} $$
+
+其中：
+- $\boldsymbol{\Phi}$ (Phi)：状态转移矩阵，描述上一时刻误差如何传导到当前时刻（例如速度误差随时间变成位置误差）。
+- $\mathbf{G}$：噪声驱动矩阵，描述传感器白噪声如何进入系统。
+
+#### **函数流程**
+
+**Step 1: 构造状态转移矩阵 $\boldsymbol{\Phi}$**
+- 一个 $19 \times 19$ 的大矩阵，体现物理规律。
+- 典型项：
+  - $\frac{\partial \mathbf{p}}{\partial \mathbf{v}} = I \cdot \Delta t$
+  - $\frac{\partial \mathbf{v}}{\partial \mathbf{b}_a} = -C_{b}^{b_0} \Delta t$
+
+**Step 2: 递推更新雅可比 $\mathbf{J}$**
+```cpp
+// 链式法则累积
+jacobian_ = phi * jacobian_;
+```
+- 作用：后端优化调整 Bias 时，直接利用 $J$ 进行一阶近似修正，避免重积分。
+
+**Step 3: 递推更新协方差 $\mathbf{P}$**
+```cpp
+// 离散KF预测公式: P = Phi * P * Phi^T + Q
+covariance_ = phi * covariance_ * phi.transpose() + Qk;
+```
+- 作用：量化预积分测量的不确定度。协方差越小，优化时该因子的权重（信息矩阵）越大。

@@ -65,7 +65,7 @@ public:
             preintegration = std::make_shared<PreintegrationOdo>(parameters, imu0, state);
         } else if (options == PREINTEGRATION_EARTH) {
             preintegration = std::make_shared<PreintegrationEarth>(parameters, imu0, state);
-        } else if (options == PREINTEGRATION_EARTH_ODO) { // 这里
+        } else if (options == PREINTEGRATION_EARTH_ODO) { // 这里:考虑地球自转的IMU/ODO预积分
             preintegration = std::make_shared<PreintegrationEarthOdo>(parameters, imu0, state); // 创建PreintegrationEarthOdo对象实例
         }
 

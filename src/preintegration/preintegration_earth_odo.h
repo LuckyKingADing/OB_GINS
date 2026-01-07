@@ -25,6 +25,9 @@
 
 #include "preintegration_base.h"
 
+/* 扩展："定量评估地球自转补偿对图优化中IMU预积分的精度影响"
+参考博客链接：http://i2nav.net/index/newListDetail_zw.do?newskind_id=f8990a24cf86440483d7821d9c2975c9&newsinfo_id=8226f3d32e8f4fa29184834c09762f5b 
+*/
 class PreintegrationEarthOdo : public PreintegrationBase {
 
 public:
@@ -78,8 +81,8 @@ private:
     Vector3d corrected_s_;
 
     Quaterniond q0_;
-    Vector3d iewn_;
-    Matrix3d iewn_skew_;
+    Vector3d iewn_; // 地球自转角速度在n系下的投影
+    Matrix3d iewn_skew_; // 地球自转角速度在n系下的反对称矩阵
 
     vector<std::pair<double, Vector3d>> pn_;
     Vector3d dpn_, dvn_;

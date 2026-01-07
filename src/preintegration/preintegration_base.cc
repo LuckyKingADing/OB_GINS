@@ -71,6 +71,7 @@ void PreintegrationBase::integration(const IMU &imu_pre, const IMU &imu_cur) {
 
 void PreintegrationBase::addNewImu(const IMU &imu) {
     imu_buffer_.push_back(imu); //push_back函数将新的IMU数据添加到imu_buffer_容器的末尾
+    // IMU 预积分
     integrationProcess(imu_buffer_.size() - 1); // 调用integrationProcess函数进行积分处理，传入最新IMU数据的索引
 }
 
@@ -83,9 +84,20 @@ void PreintegrationBase::reintegration(IntegrationState &state) {
     }
 }
 
+// 对前一历元和当前历元的IMU的角度增量和速度增量观测值，进行零偏误差补偿
 IMU PreintegrationBase::compensationBias(const IMU &imu) const {
     IMU imu_calib = imu;
-    imu_calib.dtheta -= imu_calib.dt * delta_state_.bg;
+
+    // 补偿陀螺仪零偏 (Angular Rate Bias -> Angle Increment)
+        // 原始测量的是角度增量 dtheta (rad)
+        // 零偏 bg 是角速度 (rad/s)
+        // 修正公式: dtheta_true = dtheta_meas - bg * dt
+    imu_calib.dtheta -= imu_calib.dt * delta_state_.bg; 
+
+    // 补偿加速度计零偏 (Specific Force Bias -> Velocity Increment)
+        // 原始测量的是速度增量 dvel (m/s)
+        // 零偏 ba 是加速度 (m/s^2)
+        // 修正公式: dvel_true = dvel_meas - ba * dt
     imu_calib.dvel -= imu_calib.dt * delta_state_.ba;
 
     return imu_calib;
