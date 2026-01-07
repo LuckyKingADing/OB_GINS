@@ -209,4 +209,117 @@ isearth: true   # 启用地球自转补偿
 - 预积分补偿：`src/preintegration/preintegration_earth_odo.cc:250-284`
 
 
- 初始状态转换为数据格式存入状态数据列表，因为ceres求解时使用的是数据格式，即double格式，而不是状态向量格式，vector3d和quaterniond格式
+ 7. 初始状态转换为数据格式存入状态数据列表，因为ceres求解时使用的是数据格式，即double格式，而不是状态向量格式，vector3d和quaterniond格式
+
+ 8. 设置下一个积分的节点时刻sow（整秒），两个积分节点的间隔固定设置为1s，由于GNSS的采样间隔也是1s，因此sow也是GNSS数据的观测时刻。
+
+9. 对比sow、上一历元imu_pre和当前历元imu_cur的IMU数据观测时间（isNeedInterpolation函数），分以下四种情况：
+
+（1）sow新于imu_cur，只进行INS解算（integrationProcess函数）。
+
+（2）sow靠近imu_pre，阈值是两个时刻小于0.0001s，先GNSS/INS松组合解算，再进行INS解算。
+
+（3）sow靠近imu_cur，阈值同上，先INS解算，再GNSS/INS松组合解算。
+
+（4）sow在imu_pre和imu_cur之间，先内插INS观测数据（imuInterpolation函数），再进行INS前半部分解算，进行GNSS/INS松组合解算，再进行INS后半部分解算。
+
+Gemini Pro
+**IMU内插处理逻辑（代码实现）**
+
+`sow` 在这里是 **下一个积分节点时间** (Start of Week/Second of Week)，也就是我们需要对齐的目标时间点。`IMU` 数据是离散的，采样时间点不一定刚好落在 `sow` 上，所以需要处理。
+
+代码中 `isNeedInterpolation` 函数判断 `sow` 落在 `imu_pre` (上一个IMU数据) 和 `imu_cur` (当前IMU数据) 之间的位置情况，返回值 `isneed` 定义了三种处理方式：
+
+**1. `sow` 非常靠近 `imu_pre` (`isneed == -1`)**
+
+- **情况**：目标时间点几乎就是上一帧的时间。
+- **处理**：什么都不做。因为上一帧的时间点已经基本上就是我们需要的时间点了，直接使用上一帧作为结束即可（实际上上一轮循环可能已经处理了）。
+
+**2. `sow` 非常靠近 `imu_cur` (`isneed == 1`)**
+
+- **情况**：目标时间点几乎就是当前帧的时间。
+- **处理**：直接把当前帧 `imu_cur` 加入到预积分中，并更新 `imu_pre` 和 `imu_cur` 为下一帧。这表示当前帧刚好就是我们要的积分结束点。
+  ```cpp
+  else if (isneed == 1) { // sow靠近imu_cur
+      preintegrationlist.back()->addNewImu(imu_cur);
+      imu_pre = imu_cur;
+      imu_cur = imufile.next();
+  }
+  ```
+
+**3. `sow` 在 `imu_pre` 和 `imu_cur` 中间 (`isneed == 2`)**
+
+- **情况**：目标时间点夹在两帧之间，且都不靠近，需要精确分割。
+- **处理**：调用 `imuInterpolation` 进行线性插值。
+    - 将 `imu_cur` (这里传入参数名为 `imu01`) 拆分成两部分：
+        - `imu00` (前一部分)：从 `imu_pre` 结束时刻 到 `sow`。这部分属于**当前积分周期**。
+        - `imu11` (后一部分)：从 `sow` 到 `imu_cur` 结束时刻。这部分属于**下一个积分周期**。
+    - 将前半部分 `imu00`（即 `imu_pre`）加入到当前的预积分对象中。
+    - `imu_pre` 会被更新为后半部分 `imu11` (在函数内部通过引用修改)，以便下一个循环使用，作为下一周期的起始。
+
+  ```cpp
+  else if (isneed == 2) { // sow在imu_pre和imu_cur之间
+      // imuInterpolation(原始数据, 输出的前半段, 输出的后半段, 分割时间点)
+      imuInterpolation(imu_cur, imu_pre, imu_cur, sow);
+      preintegrationlist.back()->addNewImu(imu_pre);
+  }
+  ```
+
+**简单总结**
+- **刚好切在当前帧尾巴** -> 直接用当前帧。
+- **切在两帧中间** -> 把当前帧劈成两半，前半截给现在用，后半截留给下次用。
+
+### 7. 数据处理主流程（src/ob_gins.cc）详解
+
+整个系统基于一个主循环 `while(true)` 运行，核心逻辑是按时间顺序处理 IMU 数据，并以 `sow`（整秒时刻）为界限触发优化。
+
+#### **核心逻辑全景图**
+
+每次循环迭代代表处理 **一帧新的 IMU 数据**。
+
+**步骤 1：加入 IMU 数据 (无条件)**
+```cpp
+preintegrationlist.back()->addNewImu(imu_cur);
+```
+- 不管是哪一帧，先塞进预积分器进行状态推算（机械编排）。此时系统的实时状态已更新。
+
+**步骤 2：判断是否跨越了积分节点 (sow)**
+```cpp
+if (imu_cur.time > sow) {
+    // 【分支A】跨越了节点 -> 触发优化、切分
+} else {
+    // 【分支B】没跨越节点 -> 仅记录中间轨迹
+}
+```
+
+#### **【分支 A】 跨越了积分节点 (`if` 块)**
+这意味着 `imu_cur` 的时间跑到了目标时刻 `sow` 后面，需要在这个整秒时刻进行“截断”和“结算”。
+
+1. **对齐 GNSS**：读取并预处理整秒处的 GNSS 数据（粗差剔除、中断模拟等）。
+2. **IMU 内插/精细处理**：调用 `isNeedInterpolation` 确保积分严格截止在 `sow` 时刻（可能需要将某一帧劈成两半）。
+3. **构建与优化**：
+   - 将对齐后的状态存入滑窗。
+   - 构建因子图（添加位姿、GNSS、预积分、零偏等因子）。
+   - 调用 Ceres Solver 进行求解。
+4. **边缘化与重置**：
+   - 滑窗满了则边缘化最老帧。
+   - 生成新的预积分器，`sow` 增加 1.0 秒，准备下一轮。
+
+#### **【分支 B】 没跨越节点 (`else` 块)**
+处在两个整秒节点之间（例如 `sow=100`, `time=99.05`）。虽然不做优化，但需要输出**高频轨迹**。
+
+```cpp
+auto integration = *preintegrationlist.rbegin();
+writeNavResult(..., integration->currentState(), ...);
+```
+- 直接获取当前预积分器的推算状态（包含刚才步骤1塞进去的数据）。
+- 写入结果文件。这保证了输出轨迹是高频（如200Hz）的，而非仅有每秒的优化点。
+
+#### **流程总结**
+
+1. **一直吃数据**：不断把 IMU 数据塞进预积分器，同时输出高频推算轨迹（走 `else` 分支）。
+2. **到点就算账**：一旦发现时间跨过了整秒 `sow`（走 `if` 分支），就进行内插截断、对齐 GNSS、执行优化修正，然后开启下一个周期。
+
+
+
+

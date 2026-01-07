@@ -214,36 +214,40 @@ int main(int argc, char *argv[]) {
 
     // 读取下一个整秒GNSS
     gnss                = gnssfile.next();
-    parameters->gravity = Earth::gravity(gnss.blh);
-    gnss.blh            = Earth::global2local(station_origin, gnss.blh);
+    parameters->gravity = Earth::gravity(gnss.blh); // 每次读取新的GNSS后，更新重力加速度
+    gnss.blh            = Earth::global2local(station_origin, gnss.blh); // 转为相对于站心坐标系原点的位置
 
     // 边缘化信息
-    std::shared_ptr<MarginalizationInfo> last_marginalization_info;
-    std::vector<double *> last_marginalization_parameter_blocks;
+    std::shared_ptr<MarginalizationInfo> last_marginalization_info; // 上一个边缘化信息
+    std::vector<double *> last_marginalization_parameter_blocks;    // 上一个边缘化参数块
 
     // 下一个积分节点
-    sow += INTEGRATION_LENGTH;
+    sow += INTEGRATION_LENGTH;  // 下一个积分周期起始时间，当前积分周期起始时间加上积分长度INTEGRATION_LENGTH（目前为1秒）
 
     while (true) {
-        if ((imu_cur.time > endtime) || imufile.isEof()) {
+        if ((imu_cur.time > endtime) || imufile.isEof()) { // 结束条件：当前IMU时间超过结束时间，或者IMU文件读到末尾
             break;
         }
 
-        // 加入IMU数据
+        // （当imu_cur.time<=sow时，会一直循环执行addNewImu()函数）
+        // 加入IMU数据：循环读取imu数据，直到当前IMU时间超过下一个积分节点时间sow，
         // Add new imu data to preintegration
-        preintegrationlist.back()->addNewImu(imu_cur); // sow新于imu_cur(即if(imu_cur.time < sow))，则不会进入下面的插值，直接加入当前imu_cur
+        preintegrationlist.back()->addNewImu(imu_cur); // 将当前IMU数据加入到当前预积分对象中,back()获取deque容器中最后一个元素的引用，即当前预积分对象；队列deque，先入先出，所以back()是当前正在处理的预积分对象
 
-        imu_pre = imu_cur;
-        imu_cur = imufile.next();
+        imu_pre = imu_cur;        // 
+        imu_cur = imufile.next(); // 读下一个新的imu
 
-        if (imu_cur.time > sow) {
+        /* 注： 设置下一个积分的节点时刻sow（整秒），两个积分节点的间隔固定设置为1s，由于GNSS的采样间隔也是1s，因此sow也是GNSS数据的观测时刻。 */
+        if (imu_cur.time > sow) { // 当前IMU时间超过下一个积分节点时间sow，说明需要进行积分了；不超过则继续往preintegration加入IMU数据
             
-            // 如果当前IMU数据时间等于GNSS数据时间, 读取新的GNSS
+            // 如果当前IMU数据时间大于sow, 读取新的GNSS
             // add GNSS and read new GNSS
-            if (fabs(gnss.time - sow) < MINIMUM_INTERVAL) {
+            if (fabs(gnss.time - sow) < MINIMUM_INTERVAL) { // MINIMUM_INTERVAL = 0.001，说明当前GNSS时间和下一个积分节点时间sow基本相等
                 gnsslist.push_back(gnss);
 
-                gnss = gnssfile.next();
+                gnss = gnssfile.next(); // 读取下一个GNSS数据
+
+                // 粗差检测：固定阈值GNSS抗差 (m)：0.2
                 while ((gnss.std[0] > gnssthreshold) || (gnss.std[1] > gnssthreshold) ||
                        (gnss.std[2] > gnssthreshold)) {
                     gnss = gnssfile.next();
@@ -252,18 +256,19 @@ int main(int argc, char *argv[]) {
                 // 中断配置
                 // do GNSS outage
                 if (isuseoutage) {
-                    if (lround(gnss.time) == outagetime) {
+                    if (lround(gnss.time) == outagetime) { // lround()将double类型的gnss.time四舍五入取整为long类型，与outagetime比较
                         std::cout << "GNSS outage at " << outagetime << " s" << std::endl;
-                        for (int k = 0; k < outagelen; k++) {
+                        for (int k = 0; k < outagelen; k++) { // 中断长度内，持续读取GNSS数据，直到中断结束
                             gnss = gnssfile.next();
                         }
-                        outagetime += outageperiod;
+                        outagetime += outageperiod; // 更新下一个中断时间
                     }
                 }
 
                 parameters->gravity = Earth::gravity(gnss.blh);
                 gnss.blh            = Earth::global2local(station_origin, gnss.blh);
-                if (gnssfile.isEof()) {
+
+                if (gnssfile.isEof()) { // 如果GNSS文件读到末尾，重置gnss.time为0，避免后续判断出错
                     gnss.time = 0;
                 }
             }
@@ -271,21 +276,27 @@ int main(int argc, char *argv[]) {
             // IMU内插处理
             // IMU interpolation
             int isneed = isNeedInterpolation(imu_pre, imu_cur, sow);
-            if (isneed == -1) {
-            } else if (isneed == 1) {
-                preintegrationlist.back()->addNewImu(imu_cur);
+            if (isneed == -1) { // sow靠近imu_pre
+            } else if (isneed == 1) { // sow靠近imu_cur
+                preintegrationlist.back()->addNewImu(imu_cur); // 将imu_cur加入当前预积分对象
 
-                imu_pre = imu_cur;
+                // 将当前imu_cur加入当前预积分对象之后，更新imu_pre和imu_cur
+                imu_pre = imu_cur; 
                 imu_cur = imufile.next();
-            } else if (isneed == 2) {
+            } else if (isneed == 2) { // sow在imu_pre和imu_cur之间
+                // imuInterpolation(原始数据, 输出的前半段, 输出的后半段, 分割时间点)
+                // 注意这里第二个和第三个参数分别是 imu_pre 和 imu_cur
+                // 实际上是将 imu_cur 这个时间段的数据拆分，
+                // 前半段存入 imu_pre (作为当前积分周期的最后一帧), 
+                // 后半段存入 imu_cur (作为下个周期的第一帧预备)
                 imuInterpolation(imu_cur, imu_pre, imu_cur, sow);
                 preintegrationlist.back()->addNewImu(imu_pre);
             }
 
             // 下一个积分节点
             // next time node
-            timelist.push_back(sow);
-            sow += INTEGRATION_LENGTH;
+            timelist.push_back(sow); // 时间列表，存入当前积分周期起始时间
+            sow += INTEGRATION_LENGTH; // 更新下一个积分节点时间
 
             // 当前整秒状态加入到滑窗中
             state_curr                               = preintegrationlist.back()->currentState();
@@ -517,8 +528,9 @@ int main(int argc, char *argv[]) {
             preintegrationlist.emplace_back(
                 Preintegration::createPreintegration(parameters, imu_pre, state_curr, preintegration_options));
         } else {
-            auto integration = *preintegrationlist.rbegin();
-            writeNavResult(integration->endTime(), station_origin, integration->currentState(), navfile, errfile);
+            // imu_cur.time <= sow,不进入积分，只记录轨迹点，然后继续读取下一个IMU数据并加入预积分 addNewImu()
+            auto integration = *preintegrationlist.rbegin(); // 获取当前预积分对象
+            writeNavResult(integration->endTime(), station_origin, integration->currentState(), navfile, errfile); // 输出当前状态到文件
         }
     }
 
@@ -596,7 +608,7 @@ void imuInterpolation(const IMU &imu01, IMU &imu00, IMU &imu11, double mid) {
 }
 
 int isNeedInterpolation(const IMU &imu0, const IMU &imu1, double mid) {
-    double time = mid;
+    double time = mid; // mid即sow, 下一个积分节点时间
 
     if (imu0.time < time && imu1.time > time) {
         double dt = time - imu0.time;
@@ -619,5 +631,7 @@ int isNeedInterpolation(const IMU &imu0, const IMU &imu1, double mid) {
         return 2;
     }
 
+    // 不需内插
+    // no need interpolation
     return 0;
 }

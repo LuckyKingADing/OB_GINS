@@ -70,8 +70,8 @@ void PreintegrationBase::integration(const IMU &imu_pre, const IMU &imu_cur) {
 }
 
 void PreintegrationBase::addNewImu(const IMU &imu) {
-    imu_buffer_.push_back(imu);
-    integrationProcess(imu_buffer_.size() - 1);
+    imu_buffer_.push_back(imu); //push_back函数将新的IMU数据添加到imu_buffer_容器的末尾
+    integrationProcess(imu_buffer_.size() - 1); // 调用integrationProcess函数进行积分处理，传入最新IMU数据的索引
 }
 
 void PreintegrationBase::reintegration(IntegrationState &state) {
