@@ -284,11 +284,7 @@ int main(int argc, char *argv[]) {
                 imu_pre = imu_cur; 
                 imu_cur = imufile.next();
             } else if (isneed == 2) { // sow在imu_pre和imu_cur之间
-                // imuInterpolation(原始数据, 输出的前半段, 输出的后半段, 分割时间点)
-                // 注意这里第二个和第三个参数分别是 imu_pre 和 imu_cur
-                // 实际上是将 imu_cur 这个时间段的数据拆分，
-                // 前半段存入 imu_pre (作为当前积分周期的最后一帧), 
-                // 后半段存入 imu_cur (作为下个周期的第一帧预备)
+                // imuInterpolation(原始数据, 输出的前半段, 输出的后半段, 分割时间点)；处理完之后imu_pre对应时间就是sow时刻，相当于从上一帧(已经在while循环开头处加入preintegration)到imu_pre(也就是sow时刻)的IMU数据已经加入当前预积分对象中了
                 imuInterpolation(imu_cur, imu_pre, imu_cur, sow);
                 preintegrationlist.back()->addNewImu(imu_pre);
             }
@@ -306,77 +302,129 @@ int main(int argc, char *argv[]) {
             // 构建优化问题
             // construct optimization problem
             {
-                ceres::Problem::Options problem_options;
-                problem_options.enable_fast_removal = true;
+                // (1) 配置优化参数
+                ceres::Problem::Options problem_options;    // ceres问题选项
+                problem_options.enable_fast_removal = true; // 启用快速移除功能
 
-                ceres::Problem problem(problem_options);
-                ceres::Solver solver;
-                ceres::Solver::Summary summary;
-                ceres::Solver::Options options;
-                options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
-                options.linear_solver_type         = ceres::SPARSE_NORMAL_CHOLESKY;
-                options.num_threads                = 4;
+                ceres::Problem problem(problem_options); // 创建ceres问题实例，传入options
+                ceres::Solver solver;                   // 创建求解器实例
+                ceres::Solver::Summary summary;         // 求解器摘要
+                ceres::Solver::Options options;         // 设置求解器选项
 
-                // 参数块
+                // 求解器参数设置
+                options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT; // 信赖域算法类型：LM算法
+                options.linear_solver_type         = ceres::SPARSE_NORMAL_CHOLESKY; // 线性求解器类型：稀疏矩阵的Cholesky分解
+                options.num_threads                = 4; // 线程数
+
+                // (2) 添加参数块（AddParameterBlock函数）
+                // 参数块：将位置、姿态、速度、零偏、里程计比例因子添加到优化的参数块中。
                 // add parameter blocks
-                for (size_t k = 0; k <= preintegrationlist.size(); k++) {
-                    // 位姿
-                    ceres::Manifold *manifold = new PoseManifold();
-                    problem.AddParameterBlock(statedatalist[k].pose, Preintegration::numPoseParameter(), manifold);
-
-                    problem.AddParameterBlock(statedatalist[k].mix,
-                                              Preintegration::numMixParameter(preintegration_options));
+                for (size_t k = 0; k <= preintegrationlist.size(); k++) { 
+                    // 位姿：位置3、姿态4,共7个状态量
+                    ceres::Manifold *manifold = new PoseManifold(); // 位姿流形，因为位姿包含四元数，需要定义流形以处理四元数的单位约束
+                    problem.AddParameterBlock(
+                        statedatalist[k].pose,  // 参数块数据指针，pose包含位置和姿态，即double[7]
+                        Preintegration::numPoseParameter(),  // 参数块维度：7
+                        manifold
+                    ); 
+                    //  速度、零偏、里程计比例因子
+                    problem.AddParameterBlock(
+                        statedatalist[k].mix, // 参数块数据指针，mix包含速度、零偏和里程计比例因子等，最多double[18](此处只用到10维，如果还需要估计其他参数量，可以增加NUM_MIX的大小维度)
+                        Preintegration::numMixParameter(preintegration_options) //  NUM_MIX = 10, vel + bias + sodo : 3 + 6 + 1 = 10
+                    );
                 }
 
-                // GNSS残差
+                // (3) 添加残差块（AddResidualBlock函数）
+                    /* PS：
+                    1.这些残差因子类都继承于Ceres的代价函数CostFunction类，由于采用Ceres库的解析求导（即自定义求导）的方法，因此重载了Evaluate函数，用于计算雅可比矩阵和残差矩阵，详见附录。
+                    2.其中，只有GNSS因子使用了LossFunction类的Huber损失函数（即核函数）HuberLoss，用于剔除异常值，降低异常值的权重；其他因子未使用损失函数。 */
+                // GNSS残差因子
                 // GNSS factors
                 int index = 0;
-
-                ceres::LossFunction *loss_function = new ceres::HuberLoss(1.0);
-                std::vector<std::pair<double, ceres::ResidualBlockId>> gnss_residualblock_id;
+                ceres::LossFunction *loss_function = new ceres::HuberLoss(1.0); // 使用Huber损失函数
+                std::vector<std::pair<double, ceres::ResidualBlockId>> gnss_residualblock_id; // 存储添加进去的残差块ID，方便后续做粗差剔除 (Outlier Culling)
                 for (const auto &gnss : gnsslist) {
-                    auto factor = new GnssFactor(gnss, antlever);
-                    for (size_t i = index; i <= preintegrationlist.size(); ++i) {
-                        if (fabs(gnss.time - timelist[i]) < MINIMUM_INTERVAL) {
+                    auto factor = new GnssFactor(gnss, antlever); // 创建GNSS因子对象，即GNSS残差因子，代价函数
+                    for (size_t i = index; i <= preintegrationlist.size(); ++i) { // 遍历滑动窗口内的所有状态节点 (i)
+                        if (fabs(gnss.time - timelist[i]) < MINIMUM_INTERVAL) { // 判断GNSS时间和积分节点时间是否基本相等
+                            // AddResidualBlock: 将约束加入因子图
+                                // 参数1: 代价函数 (Factor)
+                                // 参数2: 损失函数 (Loss Function)
+                                // 参数3: 待优化变量块 (这里只约束位姿 pose，因为 GNSS 只提供位置信息) 
+                                // 返回： 残差块ID (Residual Block ID)
                             auto id = problem.AddResidualBlock(factor, loss_function, statedatalist[i].pose);
-                            gnss_residualblock_id.push_back(std::make_pair(gnss.time, id));
+
+                            gnss_residualblock_id.push_back(std::make_pair(gnss.time, id)); // 记录残差块ID，传入GNSS时间和残差块ID
                             index++;
                             break;
                         }
                     }
                 }
 
-                // 预积分残差
+                // 添加IMU预积分残差因子：预积分残差
                 // preintegration factors
-                for (size_t k = 0; k < preintegrationlist.size(); k++) {
+               for (size_t k = 0; k < preintegrationlist.size(); k++) {
                     auto factor = new PreintegrationFactor(preintegrationlist[k]);
-                    problem.AddResidualBlock(factor, nullptr, statedatalist[k].pose, statedatalist[k].mix,
-                                             statedatalist[k + 1].pose, statedatalist[k + 1].mix);
+                    problem.AddResidualBlock(
+                        factor,                   // 代价函数：预积分约束
+                        nullptr,                  // 损失函数：不使用（认为IMU误差符合高斯分布，未做鲁棒核处理）
+                        statedatalist[k].pose,    // 参数块1：第k帧的位姿（位置+姿态）
+                        statedatalist[k].mix,     // 参数块2：第k帧的混合状态（速度+零偏等）
+                        statedatalist[k + 1].pose, // 参数块3：第k+1帧的位姿
+                        statedatalist[k + 1].mix   // 参数块4：第k+1帧的混合状态
+                        /* PS：
+                        1.建立了时间序列上相邻两个状态之间的约束关系，在滑动窗口中，将相邻的每一对状态帧（State k 和 State k+1）链接起来。IMU 预积分类（PreintegrationFactor）内部计算了从 k 时刻到 k+1 时刻的理论位移、速度变化和旋转变化
+                        2.调用 AddResidualBlock 就像是在“连线”。
+                        -节点（Node）：你传入的那 4 个 double* 指针（参数块）。
+                        -边（Edge）：你创建的 factor 对象。
+                        -这条边（IMU 预积分约束）是一个 4 元边（4-ary edge），它同时连接了 4 个变量节点。Ceres 完全支持这种多元约束 */
+                    );
                 }
-                {
-                    // IMU误差控制
+                // 添加IMU零偏误差约束：仅作用于当前最新的那个状态（窗口末端的帧），边界约束，防止最新的零偏估计值因为缺乏约束而“飞，原因：防止漂移：虽然上一段代码限制了 Bias 的变化率（Random Walk），但在弱观测（如长时间缺乏有效 GNSS）或刚开始初始化时，Bias 的绝对值可能会因为缺乏全局观测而整体漂移
+                // add IMU bias-constraint factors
+                {   // IMU误差控制
                     // add IMU bias-constraint factors
-                    auto factor = new ImuErrorFactor(*preintegrationlist.rbegin());
-                    problem.AddResidualBlock(factor, nullptr, statedatalist[preintegrationlist.size()].mix);
+
+                    // 根据预积分列表的最后一个预积分对象，即当前预积分对象，创建IMU误差因子
+                    auto factor = new ImuErrorFactor(*preintegrationlist.rbegin()); // rbegin()返回deque容器中最后一个元素的反向迭代器，即当前预积分对象
+                    problem.AddResidualBlock(
+                        factor, 
+                        nullptr, 
+                        statedatalist[preintegrationlist.size()].mix // 仅约束最新的那个状态的混合分量（包含Bias）
+                    );
                 }
 
-                // 边缘化残差
-                // prior factor
+                // 添加边缘化残差因子
+                // prior factor 即先验因子
+                /* PS
+                1.作用：将上一轮被“移除”的旧状态所包含的信息，转化成一个“先验约束”，加到当前优化问题中 
+                2.在系统刚启动的前几帧（窗口没满时），还没有发生过边缘化，last_marginalization_info 是空的，所以这里会跳过，一旦窗口满了，系统开始移除旧帧，并计算出了边缘化信息（存储在 last_marginalization_info 中），这里就会进入 */
                 if (last_marginalization_info && last_marginalization_info->isValid()) {
                     auto factor = new MarginalizationFactor(last_marginalization_info);
-                    problem.AddResidualBlock(factor, nullptr, last_marginalization_parameter_blocks);
+                    problem.AddResidualBlock(
+                        factor, 
+                        nullptr, 
+                        last_marginalization_parameter_blocks // 注意这里传入的是一个 std::vector<double*>。
+                                                            // PS：为什么是 vector？ 和之前的 PreintegrationFactor 固定传入 4 个参数不同，边缘化约束连接的参数块数量是动态的。它连接了所有与“被移除变量”有过共视关系的“保留变量”。比如，被移除的第 0 帧可能和第 1, 2, ..., N 帧都有约束。因此，Ceres 允许直接传入一个包含所有相关参数块指针的 vector。
+                    );
                 }
 
-                // 求解最小二乘
+                // !!!核心：求解最小二乘
                 // solve the Least-Squares problem
-                options.max_num_iterations = num_iterations / 4;
-                solver.Solve(options, &problem, &summary);
+                    // 第一段优化
+                options.max_num_iterations = num_iterations / 4; // 最大迭代次数设置为总迭代次数的1/4
+                solver.Solve(options, &problem, &summary);       // 调用求解器求解问题：Solve(options, &problem, &summary)
 
-                // TODO: Just a example, you need remodify.
+                // GNSS质量控制：粗差剔除(卡方检验)、重加权：使用卡方检验，判断GNSS因子的代价是否超过阈值，降低超过阈值的GNSS因子的权重。
                 // Do GNSS outlier culling using chi-square test
+
+                // TODO: Just a example, you need remodify.（TODO：只是示例，你需要重新修改。）
                 if (is_outlier_culling && !gnss_residualblock_id.empty()) {
                     // 3 degrees of freedom, 0.05
-                    double chi2_threshold = 7.815;
+                    // 3 自由度：GNSS 提供了 x, y, z 三个维度的位置信息。
+                    // 7.815：对应卡方分布在 3 自由度下，置信度为 95% (p=0.05) 的临界值
+                    // 含义：如果某个 GNSS 点的计算误差平方和超过了 7.815，我们有 95% 的把握认为它不仅仅是噪声，而是一个粗差（异常值）。
+                    double chi2_threshold = 7.815; // 卡方阈值，3自由度，显著性水平0.05
 
                     // Find GNSS outliers in the window
                     std::unordered_set<double> gnss_outlier;
@@ -387,15 +435,18 @@ int main(int argc, char *argv[]) {
                         double cost;
                         double chi2;
 
-                        problem.EvaluateResidualBlock(id, false, &cost, nullptr, nullptr);
-                        chi2 = cost * 2;
+                        // 在这一步之前，其实已经运行了一次求解器 solver.Solve（代码 382 行），得到了一个初步的轨迹。
+                        // EvaluateResidualBlock：利用这个初步轨迹，回代计算当前这个 GNSS 因子的 Cost。
+                        problem.EvaluateResidualBlock(id, false, &cost, nullptr, nullptr);  
+                        chi2 = cost * 2; // Ceres 中的 cost 是残差平方和的一半，因此乘以 2 得到实际的 chi2 值
 
+                        // 重加权策略 (Reweighting Strategy)
                         if (chi2 > chi2_threshold) {
                             gnss_outlier.insert(time);
 
-                            // Reweigthed GNSS
-                            double scale = sqrt(chi2 / chi2_threshold);
-                            gnsslist[k].std *= scale;
+                            // Reweigthed GNSS 放大噪声标准差，等效于降低权重
+                            double scale = sqrt(chi2 / chi2_threshold);  // 比例因子等于实际 chi2 与阈值的比值的平方根
+                            gnsslist[k].std *= scale;  // 乘以比例因子，放大标准差
                         }
                     }
                     // // Log outliers
@@ -407,11 +458,13 @@ int main(int argc, char *argv[]) {
                     //     std::cout << log << std::endl;
                     // }
 
+                    // 删除旧的GNSS因子
                     // Remove all old GNSS factors
                     for (const auto &block : gnss_residualblock_id) {
-                        problem.RemoveResidualBlock(block.second);
+                        problem.RemoveResidualBlock(block.second); // 根据残差块ID，移除对应的GNSS残差块
                     }
 
+                    // 重新添加GNSS因子，不使用损失函数
                     // Add GNSS factors without loss function
                     index = 0;
                     for (auto &gnss : gnsslist) {
@@ -424,10 +477,27 @@ int main(int argc, char *argv[]) {
                             }
                         }
                     }
+                    /* PS： 
+                    1.为什么要先删再加？
+                    因为 GnssFactor 的权重矩阵（信息矩阵）是在构造函数里根据 gnss.std 计算死的。
+                    我们在上一步修改了 gnss.std，必须通过 new GnssFactor 重新生成因子，新的权重才会生效。
+                    2.为什么 loss_function 变成了 nullptr？
+                    第一阶段使用 HuberLoss 是为了防止粗差在这个阶段把轨迹拉得太远。
+                    第二阶段（当前阶段）我们已经手动完成了粗差的降权（通过修改 std），这相当于手动实施了一个极其精确的 Robust Kernel，所以不再需要 Huber Loss 这种通用的核函数了，直接用最小二乘求解即可 
+                    3.旧因子不可变：旧的 GnssFactor 对象里的权重是写死的，没法改。
+                    4.必须换新：必须生成新的 GnssFactor 对象才能应用新的权重。
+                    5.全量替换更简单：GNSS 因子很轻量，全删全加比精细维护“哪个要改哪个不用改”的逻辑更低成本，且不易出错。*/
                 }
 
-                options.max_num_iterations = num_iterations * 3 / 4;
-                solver.Solve(options, &problem, &summary);
+                    // 第二段优化
+                options.max_num_iterations = num_iterations * 3 / 4; // 最大迭代次数设置为总迭代次数的3/4，第一段时1/4,共加起来为num_iterations
+                solver.Solve(options, &problem, &summary);           // 再次调用求解器求解问题：Solve(options, &problem, &summary)
+
+                /* PS：
+                   1.GNSS因子的代价是指基于EvaluateResidualBlock函数，计算滑动窗口内各时刻GNSS因子的验后残差平方和，每个时刻的GNSS因子残差块对应一个验后残差平方和。
+                   2.之所以分成两段，一是为了控制GNSS质量；二是快速获取一个初步的解并进行粗略优化，之后再细致优化，逐步提高解的精度。
+                   3.执行Solve()函数时，Ceres 实际上是在无数次地循环调用上述 4 个因子中的Evaluate 和 **1 个Plus** （PoseManifold::Plus） 函数，直到误差收敛。
+                */               
 
                 // 输出进度
                 // output the percentage
@@ -440,7 +510,8 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            if (preintegrationlist.size() == static_cast<size_t>(windows)) {
+            // 滑窗与边缘化处理
+            if (preintegrationlist.size() == static_cast<size_t>(windows)) { // 如果预积分列表大小等于滑动窗口大小，说明滑动窗口已满，需要进行边缘化处理
                 {
                     // 边缘化
                     // marginalization
@@ -588,19 +659,22 @@ void writeNavResult(double time, const Vector3d &origin, const IntegrationState 
     }
 }
 
+// 示例调用：imuInterpolation(imu_cur, imu_pre, imu_cur, sow);
 void imuInterpolation(const IMU &imu01, IMU &imu00, IMU &imu11, double mid) {
-    double time = mid;
+    double time = mid; // mid即sow, 下一个积分节点时间
 
-    double scale = (imu01.time - time) / imu01.dt;
-    IMU buff     = imu01;
+    double scale = (imu01.time - time) / imu01.dt; // scale: 后半段占总时间的比例
+    IMU buff     = imu01; // 备份原始数据imu_cur
 
-    imu00.time   = time;
+    // 前半段imu增量
+    imu00.time   = time; // 从 t_start 到 mid 的 IMU 数据（用于将状态推进到 sow/GNSS 时刻)
     imu00.dt     = buff.dt - (buff.time - time);
     imu00.dtheta = buff.dtheta * (1 - scale);
     imu00.dvel   = buff.dvel * (1 - scale);
     imu00.odovel = buff.odovel * (1 - scale);
 
-    imu11.time   = buff.time;
+    // 后半段imu增量
+    imu11.time   = buff.time; // 从 mid 到 t_end 的 IMU 数据（用于下一个积分周期的预备)
     imu11.dt     = buff.time - time;
     imu11.dtheta = buff.dtheta * scale;
     imu11.dvel   = buff.dvel * scale;

@@ -115,6 +115,7 @@ public:
     static constexpr int NUM_POSE = 7;
 
 protected:
+    // 待办：可以根据你的IMU设置这些参数，参数包括陀螺和加速度计的零偏标准差、比例因子标准差，ODO比例因子标准差等
     // TODO: You can set these parameters according to your IMU
     static constexpr double IMU_GRY_BIAS_STD = 7200 / 3600.0 * M_PI / 180.0; // 7200 deg / hr
     static constexpr double IMU_ACC_BIAS_STD = 2.0e4 * 1.0e-5;               // 20000 mGal

@@ -185,7 +185,7 @@ Eigen::MatrixXd PreintegrationEarthOdo::residualJacobianMix1(const IntegrationSt
 }
 
 int PreintegrationEarthOdo::numResiduals() {
-    return NUM_STATE;
+    return NUM_STATE; // 15 维（位置3 + 速度3 + 姿态3 + 陀螺零偏3 + 加计零偏3
 }
 
 vector<int> PreintegrationEarthOdo::numBlocksParameters() {

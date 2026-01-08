@@ -111,8 +111,8 @@ public:
             num = PreintegrationOdo::NUM_MIX;
         } else if (options == PREINTEGRATION_EARTH) {
             num = PreintegrationEarth::NUM_MIX;
-        } else if (options == PREINTEGRATION_EARTH_ODO) {
-            num = PreintegrationEarthOdo::NUM_MIX;
+        } else if (options == PREINTEGRATION_EARTH_ODO) { // 考虑地球自转的IMU/ODO预积分
+            num = PreintegrationEarthOdo::NUM_MIX; // NUM_MIX = 10
         }
         return num;
     }

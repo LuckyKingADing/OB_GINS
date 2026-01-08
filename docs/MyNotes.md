@@ -475,3 +475,401 @@ jacobian_ = phi * jacobian_;
 covariance_ = phi * covariance_ * phi.transpose() + Qk;
 ```
 - 作用：量化预积分测量的不确定度。协方差越小，优化时该因子的权重（信息矩阵）越大。
+
+### 11. IMU 数据插值与对齐
+
+在 GNSS/INS 融合中，传感器的采样时间和积分周期往往不一致。代码中的 `imuInterpolation` 函数处理了这个问题。
+
+#### **核心问题**
+当一个新的 GNSS 观测到达（时刻 `sow`），我们需要把系统状态推进到这个精确时刻。然而，通常这个时刻会落在一个 IMU 采样间隔中间：
+`imu_cur.start < sow < imu_cur.end`
+
+#### **插值逻辑图解**
+
+```text
+时间轴:     t_start (上一帧结束) -------------> mid (sow) -------------> t_end (当前帧结束)
+              |                                  ^                         |
+              |<-------- imu00 (前半段) -------->|<------- imu11 (后半段) ------->|
+              |                                  |                         |
+原始数据:      |<-------------------------- imu01 (跨越帧) ------------------------->|
+```
+
+#### **代码变量复用技巧**
+在 `src/ob_gins.cc` 中，作者巧妙（但容易让人困惑）地复用了变量名：
+
+```cpp
+// 此时 imu_cur 是跨越 sow 的那个帧
+// imu_pre 是上一帧（已经被加入预积分了，此时是“旧值”）
+
+// 执行插值：
+// 输入：imu_cur (跨越多帧)
+// 输出1：imu_pre (被覆写为前半段) -> 用于完成本轮预积分
+// 输出2：imu_cur (被覆写为后半段) -> 留给下一轮预积分作为起始
+imuInterpolation(imu_cur, imu_pre, imu_cur, sow);
+
+// 将前半段加入预积分，本轮积分结束
+preintegrationlist.back()->addNewImu(imu_pre);
+```
+
+#### **数学假设**
+采用线性假设 (Linear Interpolation)：
+$$ \text{Scale} = \frac{t_{end} - t_{mid}}{t_{end} - t_{start}} $$
+$$ \Delta \theta_{front} = \Delta \theta_{total} \times (1 - \text{Scale}) $$
+$$ \Delta v_{front} = \Delta v_{total} \times (1 - \text{Scale}) $$
+假设物体在这一短时间内（例如 0.005s）做匀加速直线运动和匀速转动。
+
+### 12. 边缘化 (Marginalization) 与滑动窗口管理
+
+在 OB_GINS（以及 VINS 等基于滑窗的系统）中，边缘化是限制计算量、维持系统实时性的核心机制。它通过“Schur 补”数学操作，将移出窗口的旧状态所包含的信息，转化为对剩余状态的“先验约束”，从而避免直接丢弃旧帧导致的信息丢失。
+
+#### **边缘化流程详解**
+
+##### **1. 判定窗口状态**
+在主循环中，系统会检查当前预积分列表的大小是否达到了设定的窗口长度（`windows`）。
+```cpp
+if (preintegrationlist.size() == static_cast<size_t>(windows)) {
+    // 窗口已满，准备执行边缘化
+}
+```
+
+##### **2. 构建边缘化信息 (Construct MarginalizationInfo)**
+首先创建一个 `MarginalizationInfo` 对象，这相当于一个容器，用于收集所有与“将要被移除的状态”有关的约束。
+
+**关键步骤：**
+1.  **确定移除目标**：通常是最早的一帧（第0帧）。
+    - 移除参数：`statedatalist[0].pose`, `statedatalist[0].mix`。
+2.  **收集相关因子 (Factors)**：找出所有连接到第0帧的残差块。
+    - **上一次的边缘化因子** (`last_marginalization_info`)：这是一个递归过程，包含了更早之前的先验信息。
+    - **预积分因子** (`PreintegrationFactor`)：连接第0帧和第1帧的约束。
+    - **GNSS因子** (`GnssFactor`)：直接观测第0帧位置的约束。
+
+```cpp
+auto factor   = std::make_shared<PreintegrationFactor>(preintegrationlist[0]);
+auto residual = std::make_shared<ResidualBlockInfo>(
+    factor, nullptr,
+    std::vector<double *>{statedatalist[0].pose, statedatalist[0].mix, ...}, // 参数块列表
+    std::vector<int>{0, 1} // 这里的0, 1表示参数块列表中第0和第1个参数（即第0帧状态）是需要被边缘化的
+);
+marginalization_info->addResidualBlockInfo(residual);
+```
+
+##### **3. 执行边缘化 (Perform Marginalization)**
+调用 `marginalization_info->marginalization()`。这是最耗时的数学计算步骤。
+
+- **构造 H 矩阵**：将收集到的所有因子线性化，拼成一个巨大的 Hessian 矩阵 ($H$) 和残差向量 ($b$)。
+- **Schur 补操作**：将变量分为两部分：
+    - $x_m$ (Marginalized): 即将被移除的变量（第0帧）。
+    - $x_r$ (Remained): 需要保留的变量（与第0帧有联系的第1帧、第2帧...）。
+    - 系统通过对 $x_m$ 求导并代入，得到一个仅关于 $x_r$ 的新线性方程：
+      $$ H_{new} = H_{rr} - H_{rm} H_{mm}^{-1} H_{mr} $$
+      $$ b_{new} = b_{r} - H_{rm} H_{mm}^{-1} b_{m} $$
+
+这步操作的结果 ($H_{new}, b_{new}$) 就是我们所谓的“边缘化信息”，它作为一个先验约束，包含了 $x_m$ 曾经存在过的证据。
+
+##### **4. 状态指针调整**
+边缘化完成后，第0帧的内存会被释放。但我们的先验信息可能还引用着原来的指针地址。需要建立映射关系，将先验信息中的旧指针指向数据移动后的新指针。
+- 在 `preintegrationlist.pop_front()` 调用后，原来的 `statedatalist[1]` 变成了现在的 `statedatalist[0]`。
+- 必须通过 `address` map 告诉边缘化信息模块这个变动。
+
+##### **5. 滑动窗口位移 (Shift)**
+物理上移除数据：
+```cpp
+gnsslist.pop_front();          // 移除最老GNSS
+timelist.pop_front();          // 移除最老时间戳
+preintegrationlist.pop_front(); // 移除最老预积分
+
+// 数据前移
+for (int k = 0; k < windows; k++) {
+    statedatalist[k] = statedatalist[k + 1]; // [1]->[0], [2]->[1]...
+}
+```
+
+##### **6. 注入下一轮优化**
+在下一轮循环构建 `ceres::Problem` 时，上一步计算出的 `last_marginalization_info` 会被封装成一个 `MarginalizationFactor` 加入问题中。
+
+```cpp
+if (last_marginalization_info) {
+    auto factor = new MarginalizationFactor(last_marginalization_info);
+    problem.AddResidualBlock(
+        factor, 
+        nullptr, 
+        last_marginalization_parameter_blocks // 连接到幸存的参数块上
+    );
+}
+```
+**注意：** `MarginalizationFactor` 是一个**变长参数**的因子。它的维度是不固定的，取决于边缘化时这一帧到底和多少其他帧产生了联系。
+
+### 13. GNSS 粗差剔除 (Outlier Culling)
+
+OB_GINS 采用了一种 **“两阶段优化 + 重加权（Reweighting）”** 的策略处理 GNSS 观测中的异常值（如多路径效应、信号遮挡导致的跳变）。
+
+#### **处理流程**
+
+1.  **第一阶段优化**：正常构建因子图，使用 Huber 核函数防止巨大粗差拉崩系统，进行第一次求解。
+2.  **卡方检验 (Chi-Square Test)**：利用第一阶段的初步解，回代计算每个 GNSS 观测的残差，判断其是否符合统计规律。
+3.  **重加权 (Reweighting)**：对判定为粗差的观测值，通过放大其方差（即降低权重）来抑制其影响。
+4.  **第二阶段优化**：移除旧的 GNSS 因子，使用调整权重后的新因子重建因字图，进行最终求解。
+
+#### **关键代码逻辑**
+
+##### **1. 设定统计阈值**
+```cpp
+// 3自由度 (x,y,z)，置信度 95% (p=0.05)
+double chi2_threshold = 7.815; 
+```
+如果一个测量值的误差平方和（马氏距离）超过 7.815，我们有 95% 的把握认为它不仅仅是噪声，而是粗差。
+
+##### **2. 验算残差 (Evaluation)**
+```cpp
+problem.EvaluateResidualBlock(id, false, &cost, nullptr, nullptr);
+double chi2 = cost * 2; // Ceres cost is 1/2 * r^2
+```
+使用 `EvaluateResidualBlock` 可以在不重新优化的情况下，计算当前状态下某个因子的残差值。
+
+##### **3. 降权策略**
+```cpp
+if (chi2 > chi2_threshold) {
+    // 放大噪声标准差，等效于降低权重
+    // Weight ~ 1/std^2
+    double scale = sqrt(chi2 / chi2_threshold);
+    gnsslist[k].std *= scale; 
+}
+```
+这是一种温和的抗差手段。不直接删除数据，而是将其投影到阈值边界上。例如，如果误差是阈值的 4 倍，方差就放大 2 倍（权重减小为 1/4），限制其对系统的拉扯力。
+
+##### **4. 重构因子图**
+由于因子的权重矩阵通常在构造函数中固定，修改 `std` 后需要**销毁旧因子，创建新因子**。
+```cpp
+// 移除旧因子
+problem.RemoveResidualBlock(block.second);
+
+// 添加新因子 (注意：此时通常不再使用 Huber 核函数，因为已经手动处理了粗差)
+auto factor = new GnssFactor(gnss, antlever);
+problem.AddResidualBlock(factor, nullptr, ...);
+```
+
+### 14. Ceres Solver `Solve` 内部执行流程详解
+
+当调用 `solver.Solve(options, &problem, &summary)` 时，Ceres 并不只是简单的“计算一下”。它在后台执行了一套严密的工业级优化流程。
+
+#### **Phase 1: 预处理 (Preprocessing)**
+
+在真正开始数学迭代之前，Ceres 需要将用户友好的 `Problem` 对象转换为求解器高效的内部表示。
+
+1.  **修剪与剔除 (Pruning)**
+    *   移除没有任何残差块连接的孤立参数块。
+    *   移除被标记为 `Constant` 的参数块。
+    *   **检查数据有效性**：验证所有指针非空，所有数据非 NaN。
+
+2.  **构建程序 (Program Construction)**
+    *   将分散在内存各处的参数块（`double*`）拷贝到一个连续的**状态向量 (State Vector)** 中。
+    *   将所有高维参数（如四元数 4维）转换为流形上的切空间参数（如旋转矢量 3维）。这就是 `Manifold` 发挥作用的地方。
+
+3.  **线性代数准备 (Linear Algebra Setup)**
+    *   **重排序 (Ordering)**：对参数块进行重新排序（如使用 AMD 算法），目的是减小稀疏矩阵分解（如 Cholesky）时的填充元，提高求解速度。
+    *   **Schur 消除准备**：对于 VIO 问题，通常会识别出特征点（Landmarks）和相机位姿（Poses）的稀疏结构，准备使用 Schur 补来加速求解。
+
+#### **Phase 2: 最小化循环 (Minimizer Loop)**
+
+OB_GINS 使用的是 **Levenberg-Marquardt (LM)** 算法，这是一个“信赖域”方法。主要循环如下：
+
+1.  **评估当前状态 (Evaluate)**
+    *   调用所有 `CostFunction::Evaluate()`（包括我们写的 `PreintegrationFactor::Evaluate`）。
+    *   计算总残差 $r(x)$ 和 总代价 Cost $\frac{1}{2}\|r(x)\|^2$。
+    *   计算雅可比矩阵 $J(x)$。
+
+2.  **构建线性系统 (Linear System Construction)**
+    *   构建正规方程（Normal Equations）：
+        $$(J^T J + \mu I) \Delta x = -J^T r$$
+    *   其中 $\mu$ 是阻尼因子（LM 核心参数），用于在高斯牛顿法（$\mu \to 0$）和梯度下降法（$\mu \to \infty$）之间切换。
+
+3.  **求解步长 (Solve Step)**
+    *   使用线性求解器（如 `SPARSE_NORMAL_CHOLESKY`）解上述方程，得到建议的更新步长 $\Delta x$。
+
+4.  **并验证 (Update & Verify)**
+    *   **试探更新**：$x_{new} = x \oplus \Delta x$（$\oplus$ 表示在流形上的加法）。
+    *   **评估新状态**：计算新的 Cost。
+    *   **接受/拒绝 (Trust Region Step)**：
+        *   如果 Cost 下降足够多（$\rho > \text{threshold}$）：**接受更新**，$x \leftarrow x_{new}$，减小阻尼 $\mu$（更激进）。
+        *   如果 Cost 没怎么降甚至升了：**拒绝更新**，保持 $x$ 不变，增大阻尼 $\mu$（更保守），重新回到第 2 步。
+
+5.  **检查终止条件**
+    *   是否达到最大迭代次数（`max_num_iterations`）？
+    *   梯度是否足够小（`gradient_tolerance`）？
+    *   步长是否足够小（`parameter_tolerance`）？
+    *   Cost 变化是否足够小（`function_tolerance`）？
+    *   满足任一条件即退出。
+
+#### **Phase 3: 后处理 (Post-processing)**
+
+1.  **回写数据 (Writeback)**
+    *   将优化器内部连续向量中的最优解，拷贝回用户最初传入的 `double*` 参数块中。
+    *   如果使用了 `Manifold`，会将切空间的增量（3维）正确地应用到原始状态（四元数 4维）上。
+
+2.  **生成报告 (Summary)**
+    *   填充 `ceres::Solver::Summary` 对象。
+    *   包含：总耗时、各阶段耗时、最终 Cost、迭代次数、收敛原因等。
+
+#### **简要总结图**
+
+```mermaid
+graph TD
+    A[用户调用 Solve] --> B[预处理: 拷贝数据, 重排序]
+    B --> C{LM 迭代循环}
+    C -->|1. 计算 J, r| D[构建方程 (J'J + uI)dx = -J'r]
+    D -->|2. 求解 dx| E[计算新Cost]
+    E -->|3. 比较 Cost| F{更好了?}
+    F -->|Yes| G[接受 dx, 减小 u]
+    F -->|No| H[拒绝 dx, 增大 u]
+    G --> I{满足终止条件?}
+    H --> D
+    I -->|No| C
+    I -->|Yes| J[后处理: 回写 double*]
+    J --> K[返回]
+```
+
+#### **关键重载函数调用 (Key Valid Overrides)**
+
+在 `solver.Solve` 运行期间，Ceres 会不断回调（Callback）我们在代码中定义的重载函数。主要分为两类：**残差计算 (Evaluate)** 和 **流形更新 (Manifold)**。
+
+**1. 因子评估 (Evaluate Phase)**
+每当 LM 算法需要计算当前状态的残差 $r$ 或雅可比 $J$ 时（即流程图中的步骤 C），它会遍历所有添加的 ResidualBlock，并调用其对应的 `CostFunction::Evaluate`。
+
+在 OB_GINS 中，以下函数会被高频调用：
+
+*   **`GnssFactor::Evaluate`**
+    *   **位置**：`src/factors/gnss_factor.h` Line 44
+    *   **作用**：计算 $r_{gnss} = p_{meas} - p_{est}$，以及对位置 $p$ 的雅可比。
+    
+*   **`PreintegrationFactor::Evaluate`**
+    *   **位置**：`src/preintegration/preintegration_factor.h` Line 45
+    *   **作用**：计算 IMU 预积分残差（位置、速度、姿态、零偏误差），及其对前后两帧状态的雅可比。这是计算量最大的部分。
+
+*   **`ImuErrorFactor::Evaluate`**
+    *   **位置**：`src/preintegration/imu_error_factor.h` Line 40
+    *   **作用**：计算零偏先验误差 $r_{bias} = b / \sigma$，用于限制零偏大小。
+
+*   **`MarginalizationFactor::Evaluate`**
+    *   **位置**：`src/factors/marginalization_factor.h` Line 47
+    *   **作用**：计算边缘化先验误差 $r_{marg} = \bar{r} + J \Delta x$，引入历史约束。
+
+**2. 状态更新 (Update Phase)**
+当 LM 算法计算出更新步长 $\Delta x$ 后，准备尝试更新状态 $x_{new} = x \oplus \Delta x$ 时（即流程图中的步骤 E 和 G），它会查看该参数块是否绑定了 `Manifold`。
+
+在 OB_GINS 中，只有 **Pose (位姿)** 参数块绑定了 `PoseManifold`，因此会调用：
+
+*   **`PoseManifold::Plus`**
+    *   **位置**：`src/factors/pose_manifold.cc` Line 34
+    *   **作用**：定义位姿的加法。
+        *   位置：普通加法 $p_{new} = p + \Delta p$
+        *   **姿态**：四元数乘法 $q_{new} = q \otimes Exp(\Delta \theta)$（将切空间中的旋转失量增量 $\Delta \theta$ 映射回旋转群并应用）。
+        *   **重要性**：保证四元数始终保持单位长度，且符合旋转群 $SO(3)$ 的几何结构。
+
+*   **`PoseManifold::PlusJacobian`**
+    *   **位置**：`src/factors/pose_manifold.cc` Line 51
+    *   **作用**：计算上述加法操作相对于 $\Delta x$ 的导数。主要用于雅可比矩阵的链式法则修正（即使 Ceres 能够数值微分，提供解析解也能提高精度和速度）。
+
+**3. 普通加法**
+对于 **Mix (速度+零偏)** 参数块，代码中没有为其指定 Manifold。
+*   **行为**：Ceres 默认直接进行欧氏空间加法（vector addition）。
+    *   $v_{new} = v + \Delta v$
+    *   $b_{new} = b + \Delta b$
+*   这也是为什么你看不到 `MixManifold` 的原因。
+
+
+
+
+#### **15. 核心因子 Evaluate 实现详解**
+
+`Evaluate()` 是优化器计算“误差（Residuals）”和“梯度（Jacobians）”的最底层逻辑。在 LM 循环中被高频调用。
+
+**1. GNSS 因子 (`GnssFactor`)**
+*   **物理意义**: 几何约束。让 **IMU预测的位置 + 杆臂修正** 尽可能接近 **GNSS测量位置**。
+*   **公式**: $\mathbf{r} = \mathbf{p}_{WB} + \mathbf{R}_{WB} \cdot \mathbf{l}_{G} - \mathbf{p}_{GNSS}$
+*   **代码逻辑**:
+    1.  提取状态 $p, q$。
+    2.  计算残差 $error = p + R \cdot l - p_{gnss}$。
+    3.  **白化 (Whitening)**: 乘以权重 $W = \Sigma^{-1/2}$。
+
+**2. 预积分因子 (`PreintegrationFactor`)**
+*   **物理意义**: 动力学约束。约束相邻两帧 $i, j$ 之间的相对运动（位置、速度、姿态），使其符合 IMU 积分结果。
+*   **代码逻辑**:
+    *   这是一个 **代理 (Proxy)** 类。实际计算委托给 `preintegration_->evaluate()`。
+    *   输入涉及 4 个参数块：$Pose_i, Mix_i, Pose_j, Mix_j$。
+    *   这是计算量最大的部分，涉及预积分误差求导。
+
+**3. IMU 误差因子 (`ImuErrorFactor`)**
+*   **物理意义**: 统计约束。限制零偏 (Bias) 不发生剧烈漂移（模拟高斯随机游走）。
+*   **公式**: $\mathbf{r} = \mathbf{b} / \sigma_{rw}$。
+*   **作用**: 防止因缺乏观测导致 Bias 估计发散。
+
+**4. 边缘化因子 (`MarginalizationFactor`)**
+*   **物理意义**: 历史信息约束。代表“被移除的旧帧对当前剩余帧的约束”。
+*   **原理**: 基于线性化点 $x_0$ 的一阶泰勒展开。
+*   **公式**: $\mathbf{r}(x) = \mathbf{r}_0 + \mathbf{J}_0 (x - x_0)$
+*   **特点**: 它的雅可比 $\mathbf{J}$ 是常数（即 $\mathbf{J}_0$），对应一个固定的二次型 Cost。
+
+---
+
+#### **16. 雅可比矩阵 (Jacobian) 深度解析**
+
+雅可比矩阵是优化器的“指南针”，告诉 Solver 应该往哪个方向修改参数才能减小误差。如果 $J$ 为正，说明参数增大误差也会增大，应减小参数；反之亦然。
+
+以 `GnssFactor` 的雅可比实现为例：
+
+**残差公式**: $\mathbf{r} = \mathbf{p} + \mathbf{R} \cdot \mathbf{l}_{lever} - \mathbf{p}_{gnss}$
+
+**代码片段**:
+```cpp
+// 1. 对位置 p 的导数
+jacobian_pose.block<3, 3>(0, 0) = Matrix3d::Identity();
+
+// 2. 对旋转(四元数)的导数
+jacobian_pose.block<3, 3>(0, 3) = -q.toRotationMatrix() * Rotation::skewSymmetric(lever_);
+```
+
+**解析**:
+
+1. **对位置的导数 (Identity)**
+    *   **数学**: $\frac{\partial (\mathbf{p} + \dots)}{\partial \mathbf{p}} = \mathbf{I}$
+    *   **物理含义**: 如果位置估计偏了 1 米，残差也会偏 1 米。这是一个 1:1 的线性关系。直接平移修正即可。
+
+2. **对旋转的导数 (杆臂效应 Lever Arm Effect)**
+    *   **物理含义**: 当转动 IMU 时，虽然 IMU 中心没变，但由于**杆臂**的存在，连接在杆顶的 GNSS 天线会画弧移动。
+    *   **数学推导**:
+        *   旋转微扰: $\mathbf{R}_{new} \approx \mathbf{R}(\mathbf{I} + [\delta \theta]_{\times})$
+        *   带入误差项: $\mathbf{R}_{new}\mathbf{l} \approx \mathbf{R}\mathbf{l} - \mathbf{R}[\mathbf{l}]_{\times} \delta \theta$
+        *   求导结果: $- \mathbf{R} \cdot [\mathbf{l}]_{\times}$
+    *   **作用**: 告诉优化器，“如果位置对不上，可能是姿态歪了，请根据杆臂长度算个旋转角度修正回来”。
+
+3. **维度不匹配的处理**
+    *   参数块虽然是 7 维 (3 pos + 4 quat)，但雅可比是 6 维 (3 pos + 3 rotation vector)。
+    *   代码中 `jacobian_pose.setZero()` 清空矩阵后，只填充对应的 $3 \times 6$ 区块。对于四元数的第 4 维（实部），在流形切空间中不存在，故对应的导数为 0（或隐含处理）。
+
+#### **17. 优化流程大揭秘：谁在计算修正量？**
+
+一个常见的误区是认为 `Evaluate()` 负责计算“怎么修正状态”。事实上，**`GnssFactor` 及其 `Evaluate()` 函数只负责“告状”，不负责“判案”**。
+
+“计算修正量”这一步是在 **Ceres 求解器的内部核心（Linear Solver）** 统一计算的。
+
+**分工流程如下：**
+
+**1. 告状阶段 (Callback: `Evaluate`)**
+*   你的代码 (`GnssFactor`) 做两件事：
+    *   **提交残差 ($r$)**：“报告长官，现在的估计位置比 GNSS 测量位置偏了 0.5 米！”
+    *   **提交雅可比 ($J$)**：“报告长官，如果现在的姿态转动 1 度，会导致那个位置移动 2 米（由杆臂长度决定的变化率）！”
+*   **注意**: 此时并没有计算“到底要转几度”。只提供了**当前误差**和**梯度（斜率）**。
+
+**2. 判案阶段 (Internal: Linear Solver)**
+*   当 Ceres 收集了所有因子（GNSS、预积分、IMU误差等）的 $r$ 和 $J$ 后，它会构建巨大的线性方程组（Normal Equation）：
+    $$ (\mathbf{J}^T \mathbf{J} + \lambda \mathbf{I}) \Delta \mathbf{x} = -\mathbf{J}^T \mathbf{r} $$
+*   **这里才是计算修正量的地方！**
+*   Ceres 会综合考虑 GNSS 想让你往左转，预积分想让你往右转，最后通过求解这个方程，算出一个**全局最优的修正量 $\Delta \mathbf{x}$**（包含位置修正 $\Delta p$ 和角度修正 $\Delta \theta$）。
+*   **直观理解**: 
+    *   `Evaluate(J)` 说：转 1 度能移 2 米 ($Slope = 2$)。
+    *   `Evaluate(r)` 说：现在偏了 0.5 米 ($Error = 0.5$)。
+    *   `Solver` 算：$0.5 / 2 = 0.25$。所以决定修正 **0.25 度**。
+
+**3. 执行阶段 (Callback: `Plus`)**
+*   Solver 算出修正量 $\Delta \theta$ 后，调用 `PoseManifold::Plus`。
+*   执行数学运算：`q_new = q_old * Exp(delta_theta)`，将修正量应用到状态上。
