@@ -40,63 +40,99 @@ PreintegrationEarthOdo::PreintegrationEarthOdo(std::shared_ptr<IntegrationParame
     lodo_ = parameters_->lodo;
 }
 
+/* 作用： 
+1.“根据 IMU 积分推算出的相对运动（预期值），和优化变量里当前的位姿（估计值），到底差了多少？”*/
 Eigen::MatrixXd PreintegrationEarthOdo::evaluate(const IntegrationState &state0, const IntegrationState &state1,
                                                  double *residuals) {
+
+    // covariance_ 是在 integrationProcess 里一步步算出来的 P 矩阵（误差协方差）
+    // 计算协方差的逆的平方根 (用于白化权重)： Σ * r^T * Σ * r -> (L^T * r)^T * (L^T * r)
+        // PS：白化 (Whitening): 残差本身是有量纲和不确定度的。通过乘以信息矩阵的平方根（相当于除以标准差），将残差转化为无量纲的“马氏距离”分量，这符合最小二乘的要求。
     sqrt_information_ =
         Eigen::LLT<Eigen::Matrix<double, NUM_STATE, NUM_STATE>>(covariance_.inverse()).matrixL().transpose();
 
+        // 映射 residual 指针为矩阵
     Eigen::Map<Eigen::Matrix<double, NUM_STATE, 1>> residual(residuals);
 
-    Matrix3d dp_dbg   = jacobian_.block<3, 3>(0, 9);
-    Matrix3d dp_dba   = jacobian_.block<3, 3>(0, 12);
+    // 提取雅可比矩阵中的一阶导数
+    Matrix3d dp_dbg   = jacobian_.block<3, 3>(0, 9);  // 位置(p) 对 陀螺零偏(bg) 的导数
+    Matrix3d dp_dba   = jacobian_.block<3, 3>(0, 12); 
     Matrix3d dv_dbg   = jacobian_.block<3, 3>(3, 9);
     Matrix3d dv_dba   = jacobian_.block<3, 3>(3, 12);
     Matrix3d dq_dbg   = jacobian_.block<3, 3>(6, 9);
     Vector3d ds_dsodo = jacobian_.block<3, 1>(15, 18);
     Matrix3d ds_dbg   = jacobian_.block<3, 3>(15, 9);
 
-    // 零偏误差
-    Vector3d dbg = state0.bg - delta_state_.bg;
+    // 积分校正准备部分：计算零偏修正增量和地球自转补偿项
+    // !!!零偏误差/零偏的修正增量
+    /* PS:
+       1. delta_state_ bg ba sodo不是相对增量变化量，是积分时所使用的基准值，在整个积分过程中（integrationProcess），这个值是保持不变的，被用作积分的“假设前提，PreintegrationEarthOdo::resetState 函数（预积分初始化函数）中赋值，后续一直未变。
+       2.state0.bg ba sodo是(ceres优化器)优化后的零偏估计，而delta_state_.bg ba dsodo是预积分阶段使用的零偏估计，因此计算得到的dbg dba dsodo是优化后的零偏state0与预积分阶段使用的零偏delta_state之间的差值。*/
+    // 总的来说， state0.bg - delta_state_.bg 计算的是 k 帧处，零偏估计值的修正量，用来修正预积分结果，目的是为了对齐，让预积分结果能匹配上当前的state0。
+    Vector3d dbg = state0.bg - delta_state_.bg; 
     Vector3d dba = state0.ba - delta_state_.ba;
     double dsodo = state0.sodo - delta_state_.sodo;
 
+    // 处理地球自转对惯导位置、速度、姿态的影响，补偿其影响
     // 位置补偿项
     Vector3d p_cor{0, 0, 0};
-    for (const auto &pn : pn_) {
-        p_cor += (pn.second - state0.p) * pn.first;
+    for (const auto &pn : pn_) { //
+        p_cor += (pn.second - state0.p) * pn.first; // 
     }
-    p_cor = 2.0 * iewn_skew_ * p_cor;
+    p_cor = 2.0 * iewn_skew_ * p_cor; // 
 
     // 速度补偿项
     Vector3d v_cor;
     v_cor = 2.0 * iewn_skew_ * (state1.p - state0.p);
 
+    // 计算“基于优化变量的理论增量”:旋转增量(地球自转角度)
     // 姿态
     Vector3d dnn    = -iewn_ * delta_time_;
     Quaterniond qnn = Rotation::rotvec2quaternion(dnn);
 
+    // 位置、速度增量，加上补偿
+        // P_j - P_i - v_i*t - 1/2*g*t^2 + 补偿
     dpn_ = state1.p - state0.p - state0.v * delta_time_ - 0.5 * gravity_ * delta_time_ * delta_time_ + p_cor;
+        // V_j - V_i - g*t + 补偿
     dvn_ = state1.v - state0.v - gravity_ * delta_time_ + v_cor;
 
-    // 积分校正
+    // 积分校正：计算“基于IMU的修正增量”，根据 IMU 数据积分出来走了多少，根据更新的零偏，使用一阶泰勒近似展开式，更新预积分值。
+    // Ref：《Impact of the Earth Rotation Compensation on MEMS-IMU Preintegration of Factor Graph Optimization》-公式27
+        // 修正后的位置 = 原始积分位置 + (位置对零偏的导数 * 零偏的变化量)
+         // PS：corrected_p_ 和 delta_state_.p 都是i 时刻到 j 时刻的相对位移，并且是投影在 i 时刻的载体坐标系 (Body Frame ) 下的，现在做得是校正delta_state_.p，得到校正后的相对位移。
+         // 同理，corrected_v_ 和 delta_state_.v 都是相对速度增量，corrected_q_ 是相对旋转增量。
     corrected_p_ = delta_state_.p + dp_dba * dba + dp_dbg * dbg;
+        // 修正后的相对速度
     corrected_v_ = delta_state_.v + dv_dba * dba + dv_dbg * dbg;
+        // 修正后的相对姿态
     corrected_q_ = delta_state_.q * Rotation::rotvec2quaternion(dq_dbg * dbg);
+        // corrected_s是？，Ref：《基于图优化的LiDAR/INS/ODO/GNSS车载组合导航算法研究》-武汉大学博士论文-常乐-公式(5.8)
     corrected_s_ = delta_state_.s + ds_dbg * dbg + ds_dsodo * dsodo;
 
-    Quaterniond qnb0 = state0.q.inverse();
-    Matrix3d cnb0    = qnb0.toRotationMatrix();
-    qb0b1_           = state1.q.inverse() * qnn * state0.q;
+    // 计算最终残差：把“理论增量”和“修正后的IMU增量”做差。
+    Quaterniond qnb0 = state0.q.inverse(); // q_n^b0 
+    Matrix3d cnb0    = qnb0.toRotationMatrix();// 旋转矩阵 R^T 
+    qb0b1_           = state1.q.inverse() * qnn * state0.q; // 理论的相对旋转，q_b0^b1 = q_b1^n * q_n^b0nn * q_b0^n，用于计算姿态残差
 
     // Residuals
+        // PS：注意坐标系：前面算的 dpn_ 是在 世界系 (n系) 下的，而 corrected_p_ 是 初始时刻 Body 系 (b0系) 下的。所以要把 dpn_ 投影回 b0 系。同理，速度也是。
+        // 位置残差: R^T * dp_n - dp_b
     residual.block<3, 1>(0, 0)  = cnb0 * dpn_ - corrected_p_;
+        // 速度残差: R^T * dv_n - dv_b
     residual.block<3, 1>(3, 0)  = cnb0 * dvn_ - corrected_v_;
+        // 姿态残差: 2 * vec( q_b0b1 * q_correction )，// 差值 = 2 * vec(理论q * 测量q的逆)
     residual.block<3, 1>(6, 0)  = 2 * (qb0b1_ * corrected_q_).vec();
-    residual.block<3, 1>(9, 0)  = state1.bg - state0.bg;
+        // PS：在两个节点之间的预积分过程中，假设零偏不变。但实际上，在滑窗优化的过程中，每个积分节点的零偏作为被估计的状态参数，会不断更新校正。因此，需要根据更新后的零偏，对应更新预积分的值。
+        // 零偏残差就是前后两个时刻零偏的变化量：假设在两个节点之间的预积分过程中，零偏不变，即假设零偏稳定性：下一时刻的陀螺/加速度零偏应接近上一时刻
+        // PS：IMU 的零偏（Bias）不是常数，而是随时间缓慢变化的。通常将其建模为 随机游走过程 (Random Walk) 或 一阶高斯-马尔可夫过程
+    residual.block<3, 1>(9, 0)  = state1.bg - state0.bg; // 陀螺零偏的随机游走变化，约束
     residual.block<3, 1>(12, 0) = state1.ba - state0.ba;
+        // 里程计 (Odometer) 的相对位置约束，将 “优化变量推算出的位移” 与 “里程计预积分测量的位移” 
     residual.block<3, 1>(15, 0) = cnb0 * (state1.p - state0.p) - corrected_s_;
+        // ODO比例因子常数残差，比例因子 (Scale Factor, sodo) 建模为随机游走，残差即为前后时刻比例因子的变化量。
     residual(18)                = state1.sodo - state0.sodo;
 
+    // 信息矩阵加权：乘以信息矩阵的平方根，完成白化处理
     residual = sqrt_information_ * residual;
 
     return residual;

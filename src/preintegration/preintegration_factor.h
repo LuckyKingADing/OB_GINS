@@ -50,7 +50,7 @@ public:
             // 将参数块parameters提取赋值到两个时刻的状态量state0和state1
         preintegration_->constructState(parameters, state0, state1);
 
-        // 计算残差residual
+        // !!!硬核：计算残差residual
         preintegration_->evaluate(state0, state1, residuals);
 
         // 计算雅可比

@@ -873,3 +873,88 @@ jacobian_pose.block<3, 3>(0, 3) = -q.toRotationMatrix() * Rotation::skewSymmetri
 **3. 执行阶段 (Callback: `Plus`)**
 *   Solver 算出修正量 $\Delta \theta$ 后，调用 `PoseManifold::Plus`。
 *   执行数学运算：`q_new = q_old * Exp(delta_theta)`，将修正量应用到状态上。
+
+### 18. 预积分Evaluate深度解析：残差构建与线性化校正
+
+在 `PreintegrationEarthOdo::evaluate` 函数中，我们看到了两类核心逻辑：一类是构建**物理残差**，另一类是执行**线性化校正**。
+
+#### **1. 残差项逐行物理含义解析**
+
+```cpp
+// 1. 零偏随机游走约束 (Bias Random Walk)
+residual.block<3, 1>(9, 0)  = state1.bg - state0.bg;
+residual.block<3, 1>(12, 0) = state1.ba - state0.ba;
+```
+- **物理含义**：假设零偏随时间缓慢变化（高斯马尔可夫过程）。
+- **约束**：“下一时刻的零偏”应该非常接近“上一时刻的零偏”。
+- **坐标系**：无（传感器内部参数）。
+
+```cpp
+// 2. 里程计相对位移约束
+residual.block<3, 1>(15, 0) = cnb0 * (state1.p - state0.p) - corrected_s_;
+```
+- **cnb0 * (state1.p - state0.p)**：由 **INS/GNSS 融合解** 算出的在世界系下的位移，投影回 **b0系（初始载体系）**。
+- **corrected_s_**：由 **里程计** 测量累积得到的在 b0系 下的位移。
+- **物理含义**：强迫“宏观导航解算的相对运动”与“微观里程计测量的相对运动”保持一致。这是 VIO/GINS 中融合不同传感器的关键耦合项。
+
+```cpp
+// 3. 里程计比例因子约束
+residual(18) = state1.sodo - state0.sodo;
+```
+- **物理含义**：里程计比例因子（Scale Factor）也应保持稳定，不发生突变。
+
+#### **2. 线性化校正 (Linearization Correction) 核心逻辑**
+
+代码中最令人困惑的部分往往是这几行计算 `dbg` 及其后续修正的代码：
+
+```cpp
+Vector3d dbg = state0.bg - delta_state_.bg; 
+// ...
+corrected_p_ = delta_state_.p + dp_dbg * dbg + ...;
+```
+
+##### **Q1: 三个 "bg" 的身份大揭秘**
+
+| 变量名 | 身份 | 来源 | 数值示例 (假设) |
+| :--- | :--- | :--- | :--- |
+| **`delta_state_.bg`** | **线性化点 (Linearization Point)** | **预积分时刻**的假设值 | 0.01 (旧值) |
+| **`state0.bg`** | **优化变量 (State Variable)** | **当前优化迭代**的最新估计 | 0.012 (新值) |
+| **`state1.bg`** | **下一帧变量** | **当前优化迭代**的最新估计 | 0.0121 |
+
+##### **Q2: 为什么要算 `state0.bg - delta_state_.bg`？**
+
+这是一个 **“补救措施”**。
+
+1.  **问题**：我们在预积分阶段（几百毫秒前），是假设 $bg=0.01$ 来积分出位移 `delta_state_.p` 的。
+2.  **现状**：现在 Ceres 优化器经过几轮迭代，认为 $bg$ 其实应该是 $0.012$。
+3.  **冲突**：如果直接用旧的 `delta_state_.p` 和新的 `state0` 做残差，会导致逻辑不自洽（位移是基于旧参数算的，状态却是新参数）。
+4.  **解决**：
+    -   **笨办法**：用 $0.012$ 重新把这几百个 IMU 数据积分一遍。（太慢，至少不可行）
+    -   **巧办法 (泰勒展开)**：利用预先算好的 **雅可比矩阵 (Jacobian)** 进行一阶修正。
+
+##### **Q3: 校正流水线 (The Correction Pipeline)**
+
+这几行代码实际上构成了一个完整的校正过程：
+
+**Step 1: 准备输入 (计算 $\Delta x$)**
+```cpp
+// 计算当前估计值相对于当初积分假设值的偏差
+Vector3d dbg = state0.bg - delta_state_.bg;
+```
+这是泰勒公式 $f(x) \approx f(x_0) + J(x-x_0)$ 中的 **$(x-x_0)$** 项。
+
+**Step 2: 获取灵敏度 (提取 $J$)**
+```cpp
+// 从大雅可比矩阵中提取出“位置对陀螺零偏”的偏导数
+Matrix3d dp_dbg = jacobian_.block<3, 3>(0, 9);
+```
+这是泰勒公式中的 **$f'(x_0)$** 项。它告诉我们：如果零偏变了 1 单位，位置积分结果会偏离多少米。
+
+**Step 3: 应用校正 (计算 $f(x)$)**
+```cpp
+// Old_Integral + Jacobian * Delta_Bias
+corrected_p_ = delta_state_.p + dp_dba * dba + dp_dbg * dbg;
+```
+这样得到的 `corrected_p_` 就近似等于“假如当初我们用 $0.012$ 进行积分”应该得到的结果。
+
+通过这种机制，我们既享受了预积分带来的速度（不用重复积分），又保证了在优化参数不断调整的过程中，约束依然准确有效。
