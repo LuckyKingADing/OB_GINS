@@ -44,6 +44,8 @@ public:
         set_num_residuals(marg_info_->remainedSize());
     }
 
+    /* （1）残差矩阵  在边缘化操作中，保留的状态参数在优化过程中会发生变化。因此，由状态参数之间的变化dx，计算残差。
+       （2）雅可比矩阵  雅可比矩阵就是上一次边缘化更新后得到的雅可比矩阵 */
     bool Evaluate(const double *const *parameters, double *residuals, double **jacobians) const override {
         int marginalizaed_size = marg_info_->marginalizedSize();
         int remained_size      = marg_info_->remainedSize();

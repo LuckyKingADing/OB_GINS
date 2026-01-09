@@ -958,3 +958,611 @@ corrected_p_ = delta_state_.p + dp_dba * dba + dp_dbg * dbg;
 这样得到的 `corrected_p_` 就近似等于“假如当初我们用 $0.012$ 进行积分”应该得到的结果。
 
 通过这种机制，我们既享受了预积分带来的速度（不用重复积分），又保证了在优化参数不断调整的过程中，约束依然准确有效。
+
+### 19. 雅可比矩阵(Jacobian) 深度解析：维度与实现
+
+在解析 `PreintegrationEarthOdo` 的 `evaluate` 之后，最关键的步骤是向优化器提供导数（雅可比矩阵）。
+
+#### **1. 维度验证 (The Dimension Logic)**
+
+我们在代码中看到雅可比被分为了 4 块，这是由于 Ceres 的参数块化机制。
+总雅可比矩阵维度为 **19 x 34**。
+- **行 (Residuals, 19维)**: 
+  - 0-2: 位置 (3)
+  - 3-5: 速度 (3)
+  - 6-8: 姿态 (3)
+  - 9-11: 陀螺零偏 (3)
+  - 12-14: 加计零偏 (3)
+  - 15-17: 里程计位置 (3)
+  - 18: 里程计尺度 (1)
+- **列 (Parameters, 34维)**: 分为四个参数块
+  1. `Pose0` (7维，流形切空间为6维): $p_i, q_i$
+  2. `Mix0` (10维): $v_i, bg_i, ba_i, sodo_i$
+  3. `Pose1` (7维，流形切空间为6维): $p_j, q_j$
+  4. `Mix1` (10维): $v_j, bg_j, ba_j, sodo_j$
+
+所以代码中有四个函数分别计算这四块雅可比：
+- `residualJacobianPose0`: 9 \times 7$ (对应列块1)
+- `residualJacobianMix0`: 9 \times 10$ (对应列块2)
+- `residualJacobianPose1`: 9 \times 7$ (对应列块3)
+- `residualJacobianMix1`: 9 \times 10$ (对应列块4)
+
+#### **2. 具体实现解析 (Implementation Details)**
+
+这些矩阵极其稀疏，大部分为0。我们重点关注非零项的物理来源。
+
+##### **A. 雅可比块 1: 关于前一帧位姿 ($) 的导数**
+函数: `residualJacobianPose0`
+
+```cpp
+// 1. 位置残差关于位置 p_i 的导数
+// r_p = R_i^T * (p_j - p_i - ... )
+// 导数 = R_i^T * (-I) = -cnb0
+jaco.block(0, 0, 3, 3) = -cnb0 - ...; // 后一项为地球自转补偿项
+
+// 2. 位置残差关于姿态 q_i 的导数
+// 旋转求导经典结论: 对 R^T * v 求导，得到 [R^T * v]_\times
+jaco.block(0, 3, 3, 3) = Rotation::skewSymmetric(cnb0 * dpn_);
+```
+
+##### **B. 雅可比块 2: 关于前一帧混合状态 ($) 的导数**
+函数: `residualJacobianMix0`
+**关键特征**：这一块包含了大量的负号和 `jacobian_` 成员变量（预积分传播的雅可比）。
+
+```cpp
+// 1. 位置残差关于陀螺零偏 bg_i 的导数
+// 为什么是负的？
+// 因为残差 r = 测量值 - 修正后的预积分量
+// 修正后的预积分量 = 原始积分 + dp_dbg * delta_bg
+// 所以 r = ... - dp_dbg * bg_i
+// 导数就是 -dp_dbg
+jaco.block(0, 3, 3, 3)  = -dp_dbg;
+
+// 2. 速度残差关于速度 v_i 的导数
+// r_v = R_i^T * (v_j - v_i - ...)
+// 导数 = -R_i^T
+// 注意代码中还乘了 delta_time_，这是哪里来的？
+// 哦，那是位置残差关于速度的导数: p_j - p_i - v_i * dt
+// 所以 block(0,0) 是 -cnb0 * delta_time_
+jaco.block(0, 0, 3, 3)  = -cnb0 * delta_time_; 
+
+// 3. 零偏残差关于零偏 bg_i 的导数
+// r_bg = bg_j - bg_i
+// 导数 = -I
+jaco.block(9, 3, 3, 3)  = -Eigen::Matrix3d::Identity();
+```
+
+##### **C. 雅可比块 3 & 4: 关于后一帧 ($) 的导数**
+函数: `residualJacobianPose1`, `residualJacobianMix1`
+
+这两块相对简单，主要体现状态在下一帧的正向影响。
+- `residualJacobianPose1`:
+    - 位置残差关于 $: ^T p_j \rightarrow R_i^T$ (`cnb0`)。
+    - 速度残差关于 $: 0 (除非考虑地球自转的微小耦合项)。
+- `residualJacobianMix1`:
+    - 速度残差关于 $: ^T v_j \rightarrow R_i^T$。
+    - 零偏残差关于 $:  - bg_i \rightarrow I$。
+
+#### **总结**
+代码中的雅可比计算看似复杂，实则是以下三者的结合：
+1.  **几何运动学求导**：, p, v$ 之间的变换关系（产生 ^T, \times$ 等项）。
+2.  **预积分灵敏度传播**：$\frac{\partial \alpha}{\partial b}$（产生 `dp_dbg` 等预积分内部雅可比项）。
+3.  **残差定义符号**：残差 = 观测 - 预测，决定了正负号。
+
+### 20. 工程实现细节：Eigen::Map 与 block 操作
+
+在阅读代码时，我们会反复遇到特定的 Eigen 语法，理解它们对于看懂代码至关重要。
+
+#### **1. Eigen::Map 的作用**
+
+```cpp
+Eigen::Map<Eigen::Matrix<double, NUM_STATE, NUM_POSE, Eigen::RowMajor>> jaco(jacobian);
+```
+
+这行代码是 **Ceres Solver** 与 **Eigen** 交互的桥梁。
+
+*   **背景**：Ceres 在内部优化时，为了通用性，传递给用户的雅可比矩阵指针 `double *jacobian` 是一块**原始的一维内存数组**。
+*   **问题**：直接操作 `double*` 数组进行复杂的矩阵运算（如乘法、求逆）非常困难且容易出错。
+*   **解决**：`Eigen::Map` 相当于给这块原始内存戴上了一副“眼镜”。它不进行数据拷贝，而是直接把这块内存**视作**一个 `NUM_STATE x NUM_POSE` 的矩阵。
+*   **关键点 `Eigen::RowMajor`**：
+    *   Eigen 默认是 **列优先 (Column-Major)** 存储。
+    *   Ceres 默认是 **行优先 (Row-Major)** 存储。
+    *   如果这里漏掉了 `RowMajor`，矩阵的行列就会弄反，导致优化结果完全错误。
+
+**总结**：这句话的意思是“把 `jacobian` 指向的这块内存，当成一个行优先的 `19x7` 矩阵 `jaco` 来操作”。任何对 `jaco` 的修改都会直接改变 `jacobian` 内存中的值。
+
+#### **2. block 函数的参数含义**
+
+```cpp
+jaco.block(0, 0, 3, 3)
+```
+
+`block` 是操作子矩阵最常用的函数，它有 4 个参数：
+
+| 参数位置 | 值 | 含义 |
+| :--- | :--- | :--- |
+| 1 | **0** | **起始行索引 (Start Row)** |
+| 2 | **0** | **起始列索引 (Start Col)** |
+| 3 | **3** | **块的行数 (Block Rows)** |
+| 4 | **3** | **块的列数 (Block Cols)** |
+
+**图解**：
+```text
+(0,0) 开始 -> [ . . . ]  <-- 取 3 行
+              [ . . . ]
+              [ . . . ]
+                 ^
+                 |
+               取 3 列
+```
+
+在我们的代码中，`jaco.block(0, 0, 3, 3)` 指的是雅可比矩阵 **左上角 3x3** 的区域。
+物理上，这通常对应 **位置残差 (前3行)** 关于 **位置参数 (前3列)** 的导数块。
+
+### 21. 旋转矩阵 `cnb0` 的计算与物理含义
+
+在代码中，这一行非常关键，它决定了残差投影的坐标系方向：
+
+```cpp
+Matrix3d cnb0 = state0.q.inverse().toRotationMatrix();
+```
+
+#### **1. 代码拆解**
+
+1.  **`state0.q`**:
+    *   代表 $ 时刻的姿态四元数。
+    *   在 VIO/GINS 标准定义中，它表示 **从载体系 (Body) 到 导航系 (Navigation/World) 的旋转**。
+    *   数学符号：{b_0}^n$ (Rotation from Body to Nav)。
+
+2.  **`.inverse()`**:
+    *   求四元数的逆（对于单位四元数，即共轭）。
+    *   物理意义：将旋转方向反转。
+    *   变换结果： **从 导航系 (Navigation) 到 载体系 (Body) 的旋转**。
+    *   数学符号：^{b_0} = (q_{b_0}^n)^{-1}$。
+
+3.  **`.toRotationMatrix()`**:
+    *   将四元数转换为  \times 3$ 的方向余弦矩阵 (DCM, Rotation Matrix)。
+    *   数学符号：^{b_0}$ (Matrix projecting vectors from Nav frame to Body frame)。
+    *   这也是变量名 `cnb0` 的由来：**C** (Cosine Matrix) **n** (from Nav) **b0** (to Body0).
+
+#### **2. 为什么要算这个？**
+
+**为了“统一坐标系进行比较”。**
+
+*   **观测值 (Measurement)**: IMU 预积分出来的 `corrected_p_` 本身就是在 **$ 系（上一帧的载体系）** 下定义的相对位移。
+*   **预测值 (Prediction)**: 状态变量 `state1.p - state0.p` 是在 **$ 系（世界坐标系）** 下的位移。
+
+要计算残差（Error = Prediction - Measurement），必须把它们转换到同一个坐标系。
+这里选择**统一投回到 $ 系**：
+
+1394125 \text{Residual} = C_n^{b_0} \times (\Delta P_n) - \Delta P_{b_0} 1394125
+
+这就是为什么我们需要计算 ^{b_0}$ (`cnb0`) 并让它去乘 `dpn_` (n系下的位移差)。
+
+### 22. IMU 零偏先验因子 (ImuErrorFactor) 解析
+
+除了复杂的预积分因子，系统中还有一个简单的因子 `ImuErrorFactor`。它的作用完全不同：它是对状态量绝对值的约束。
+
+#### **1. 总体架构**
+
+*   **类名**: `ImuErrorFactor`
+*   **继承**: `ceres::CostFunction`
+*   **作用**: 为 IMU 的零偏 (`bg`, `ba`) 和里程计比例因子 (`sodo`) 提供 **先验约束 (Prior Constraint)**。
+
+#### **2. 函数深度解析**
+
+##### **A. 接口函数: `Evaluate`**
+
+```cpp
+bool Evaluate(const double *const *parameters, double *residuals, double **jacobians) const override {
+    // 委托设计模式：实际计算由 preintegration_ 对象完成
+    preintegration_->imuErrorEvaluate(parameters, residuals);
+    // ... 计算雅可比
+}
+```
+这是 Ceres 的标准回调。它仅仅是一个“传声筒”，将计算任务委托给了具体的预积分对象。这种设计允许 `ImuErrorFactor` 即使在不同的预积分策略下也能复用。
+
+##### **B. 残差计算: `imuErrorEvaluate`**
+
+```cpp
+void PreintegrationEarthOdo::imuErrorEvaluate(const double *const *parameters, double *residuals) {
+    // parameters[0] 对应 Mix 状态块: [vel(3), bg(3), ba(3), sodo(1)]
+    
+    // 1. 陀螺仪零偏残差
+    residuals[0] = parameters[0][3] / IMU_GRY_BIAS_STD; // bg_x
+    residuals[1] = parameters[0][4] / IMU_GRY_BIAS_STD; // bg_y
+    residuals[2] = parameters[0][5] / IMU_GRY_BIAS_STD; // bg_z
+
+    // 2. 加速度计零偏残差
+    residuals[3] = parameters[0][6] / IMU_ACC_BIAS_STD; // ...
+    // ...
+
+    // 3. 里程计尺度因子残差
+    residuals[6] = parameters[0][9] / ODO_SCALE_STD;    // sodo
+}
+```
+
+*   **物理含义**:  = \frac{x - 0}{\sigma}$。
+*   这是一个 **零均值先验 (Zero-Mean Prior)**。它告诉优化器：“虽然我允许零偏变化，但它们**不完全是自由的**，它们应该在 0 附近，偏离 0 越大，惩罚越大。”
+*   **为什么需要它？**
+    *   在车辆静止或运动激励不足时，零偏可能不可观（Unobservable），如果不加约束，零偏可能会漂移到无穷大或奇怪的值。
+    *   这个因子相当于给零偏加了一个“弹簧”，把它轻轻拉向 0。
+*   **注意**: 这里**没有约束速度** (indices 0,1,2 被跳过了)，因为速度显然不应该被约束为 0。
+
+##### **C. 雅可比计算: `imuErrorJacobian`**
+
+```cpp
+void PreintegrationEarthOdo::imuErrorJacobian(double *jacobian) {
+    // 映射为 7行 x 10列 的矩阵
+    Eigen::Map<Eigen::Matrix<double, NUM_ERROR_RESIDUAL, NUM_MIX, Eigen::RowMajor>> jaco(jacobian);
+    jaco.setZero();
+
+    // 导数非常简单： r = x/sigma  ->  dr/dx = 1/sigma
+    jaco(0, 3) = 1.0 / IMU_GRY_BIAS_STD; // d(r_bgx) / d(bgx)
+    jaco(1, 4) = 1.0 / IMU_GRY_BIAS_STD;
+    // ... 依次类推，形成对角矩阵块
+}
+```
+
+*   **维度**:  \times 10$。
+*   **结构**: 
+    *   前3列 (Velocity) 全为 0。
+    *   后7列 (Bias & Scale) 对角线上有非零值。
+*   **数学本质**: 提供了一个对角形式的 Hessian 矩阵近似（也就是信息矩阵），增加了系统的数值稳定性。
+# OB_GINS 代码研读笔记
+
+## 1. ImuErrorFactor 机制解析
+
+### 功能与目的
+`ImuErrorFactor` 的核心作用是防止 IMU 的 Bias (零偏) 和 Scale (比例因子) 在优化过程中发生发散。
+- 在松耦合或某些观测较弱的情况下（如 GNSS 短时中断）， Bias 可能会因为缺乏约束而在零空间（Null Space）中漂移。
+- 该 Factor 引入了一个 **零均值高斯先验 (Zero-mean Gaussian Prior)**，即认为 Bias 和 Scale 应该在 0 附近的一个合理范围内。
+
+### 数学形式
+残差计算遵循标准形式 $r = \frac{x - 0}{\sigma}$：
+$$ r_{bias} = \frac{b}{\sigma_{bias}} $$
+$$ r_{scale} = \frac{s}{\sigma_{scale}} $$
+
+### 代码位置
+- **定义**: `src/preintegration/imu_error_factor.h`
+- **实现**: 实际调用 `preintegration_->imuErrorEvaluate` 计算残差。
+- **添加策略**: 在 `src/ob_gins.cc` 中，仅对滑动窗口中的 **最新一帧** (`*preintegrationlist.rbegin()`) 添加此 Factor。这作为一种软约束（Soft Constraint），引导系统保持稳定。
+
+---
+
+## 2. IMU 参数配置辨析：Random Walk vs. Absolute Bound
+
+代码中存在两套看似相似但作用完全不同的 IMU 参数，这是一个常见的设计模式。
+
+### A. 配置参数 (YAML / Config)
+- **变量名**: `gyr_bias_std`, `acc_bias_std` (在 `ob_gins.cc` 中读取)
+- **数学意义**: **Random Walk (随机游走) 噪声** / 处理噪声 (Process Noise, $Q$)。
+- **物理含义**: 约束 **相邻时刻** Bias 的变化量。即 $b_{k+1} = b_k + n$，其中 $n \sim N(0, \sigma^2)$。
+- **作用**: 决定了 Bias 变化的“平滑度”。值越小，认为 Bias 越稳定，不允许突变；值越大，允许 Bias 快速变化。
+- **比喻**: **狗绳的长度**。它限制了狗（Bias）相对于主人（上一时刻的值）能跑多远。
+
+### B. 硬编码常量 (Header Constant)
+- **变量名**: `IMU_GRY_BIAS_STD`, `IMU_ACC_BIAS_STD`, `IMU_SCALE_STD` (在 `src/preintegration/preintegration_base.h` 中定义)
+- **数学意义**: **Prior Bound (先验界限)** / 观测噪声 (Measurement Noise, $R_{prior}$)。
+- **物理含义**: 约束 Bias 相对于 **零点** 的绝对大小。即 $b \approx 0$。
+- **作用**: 防止数值爆炸。这是一个非常宽泛的界限（例如陀螺仪 Bias 设为 7200 deg/h），仅在系统解算极度不稳定时才会产生强约束，正常运行时几乎不影响结果。
+- **比喻**: **公园的围栏**。它限制了狗（Bias）绝对不能跑出这个公园（合理的传感器物理范围），防止它跑丢（数值发散）。
+
+### 总结
+| 特性 | Random Walk (YAML) | Absolute Bound (Header) |
+| :--- | :--- | :--- |
+| **约束对象** | $b_{k+1} - b_k$ (相对变化) | $b_k - 0$ (绝对值) |
+| **控制目标** | 平滑性 (Smoothness) | 稳定性/有界性 (Stability) |
+| **典型数值** | 小 (如 10 deg/h) | 极大 (如 7200 deg/h) |
+| **对应 Factor** | 预积分中的 Bias 更新部分 | `ImuErrorFactor` |
+
+---
+
+## 3. 实现细节备忘
+
+### Jacobian 维度
+在 `PreintegrationEarthOdo` 中：
+- `residualJacobianPose0` 是 `15x7` 或 `19x7` (取决于是否包含 Scale/Misalignment)。
+- `Mix0` (状态增量 Jacobian) 是 `19x34` (或类似高维矩阵)，使用 `Eigen::Map` 进行内存复用操作。
+
+### 坐标系投影
+在计算残差时，代码常出现如下模式：
+```cpp
+Matrix3d cnb0 = state0.q.inverse().toRotationMatrix(); 
+// 或者
+Vector3d res_body = cnb0 * res_world;
+```
+这是将世界系（World/Nav Frame）下的残差投影回载体系（Body Frame）。这是因为 IMU 的误差模型（如 Bias, Scale）通常定义在传感器自身坐标系下。
+
+## 4. 深入代码实现：参数作用域对比
+
+### A. 配置参数 (YAML) 的作用：`setNoiseMatrix`
+
+配置参数 (`gyr_bias_std`) 用于定义预积分过程中的 **过程噪声矩阵 (Q Matrix)**。
+
+- **位置**: `src/preintegration/preintegration_earth.cc` -> `setNoiseMatrix()`
+- **代码逻辑**:
+  ```cpp
+  // 典型的 First-Order Gauss-Markov Process 噪声功率谱密度计算
+  // Q = 2 * sigma^2 / tau
+  noise_.block<3, 3>(6, 6) *= 
+      2 * parameters_->gyr_bias_std * parameters_->gyr_bias_std / parameters_->corr_time;
+  ```
+- **物理意义**: 决定了在积分过程中，Bias 的不确定度(Uncertainty)随时间增长的速度。
+
+### B. 硬编码常量 (Header) 的作用：`imuErrorEvaluate`
+
+硬编码常量 (`IMU_GRY_BIAS_STD`) 用于定义特定 Factor (`ImuErrorFactor`) 的 **观测噪声矩阵 (R Matrix)**。
+
+- **位置**: `src/preintegration/preintegration_earth.cc` -> `imuErrorEvaluate()`
+- **代码逻辑**:
+  ```cpp
+  // 零均值先验残差计算: r = (x - mean) / sigma
+  // 这里 sigma = IMU_GRY_BIAS_STD (7200 deg/hr)
+  residuals[0] = parameters[0][3] / IMU_GRY_BIAS_STD; 
+  residuals[1] = parameters[0][4] / IMU_GRY_BIAS_STD;
+  ```
+- **物理意义**: 定义了一个非常“松”的弹簧，仅在系统状态数值爆炸时提供最后一道防线，防止 Bias 漂移到物理上不可能的数值。
+
+## 5. 边缘化 (Marginalization) 核心流程解析
+
+代码入口：`marginalization_info->marginalization();`
+该函数实现了将滑动窗口中最老帧的约束信息转化为先验信息的过程。
+
+### 核心步骤
+
+#### 1. 参数分类与索引 (`updateParameterBlocksIndex`)
+- **目的**: 区分"被丢弃参数"($)和"保留参数"($)。
+- **操作**: 将 $ 索引排在最前 (0~m)，$ 排在后 (m~n)，为构建分块矩阵做准备。
+
+#### 2. 预处理与备份 (`preMarginalization`)
+- **目的**: 确定线性化点。
+- **操作**: 
+    - 调用 `cost_function_->Evaluate` 计算当前雅可比 $ 和残差 $。
+    - **深拷贝**参数数值到 `parameter_block_data_`。先验约束必须基于特定的线性化点 ($)，即  \approx J(x - x_0)$。
+
+#### 3. 构建线性方程系统 (`constructEquation`)
+- **目的**: 组装整个局部系统的 Hessian 矩阵。
+- **公式**:  \delta x = b$
+    -  = \sum J_i^T J_i$
+    -  = -\sum J_i^T e_i$
+- **代码**: 遍历所有因子的雅可比，累加到大矩阵 `H0_` 和向量 `b0_` 的对应块中。
+
+#### 4. Schur 补消元 (`schurElimination`)
+- **目的**: 数学核心，消除 $。
+- **公式**:
+    2519472 \begin{bmatrix} H_{mm} & H_{mr} \ H_{rm} & H_{rr} \end{bmatrix} \begin{bmatrix} \delta x_m \ \delta x_r \end{bmatrix} = \begin{bmatrix} b_m \ b_r \end{bmatrix} 2519472
+    利用 Schur Complement 得到关于保留参数的先验信息矩阵 $ 和向量 $：
+    -  = H_{rr} - H_{rm} H_{mm}^{-1} H_{mr}$
+    -  = b_r - H_{rm} H_{mm}^{-1} b_m$
+- **实现细节**: 使用 Eigen 的 `SelfAdjointEigenSolver` (特征值分解) 对 {mm}$ 求逆，以提高数值稳定性（类似伪逆）。
+
+#### 5. 线性化重构 (`linearization`)
+- **目的**: 适配 Ceres 接口。Ceres 需要 $ 和 $，而非 $ 和 $。
+- **操作**: 对 $ 进行分解，恢复出等效的雅可比 $ 和残差 $。
+    -  = J_0^T J_0 \Rightarrow J_0 = S^{1/2} V^T$ (由特征值分解得到)
+    -  = -(J_0^T)^{-1} b_p$
+
+### 物理意义
+将最老帧及其相关约束（IMU预积分、GNSS观测等）压缩成一个紧耦合的先验约束 Factor。即使最老帧的状态变量被移除，它所包含的信息（如零偏估计、尺度约束）依然通过此时的先验，对剩余的次老帧施加影响。
+
+### 5.1 参数索引构建详解 (`updateParameterBlocksIndex`)
+
+该函数的核心任务是 **给所有相关的参数块“排座次”**，从而构建出舒尔补所需的分块矩阵形式：
+2519472 \begin{bmatrix} H_{mm} & H_{mr} \ H_{rm} & H_{rr} \end{bmatrix} 2519472
+
+#### 举例说明
+假设滑动窗口中有两帧：
+- **Frame A (最老帧)**: `Pose_A`, `Vel_A` $\rightarrow$ **将被边缘化 (Marginalized)**
+- **Frame B (次老帧)**: `Pose_B`, `Vel_B` $\rightarrow$ **将被保留 (Remained)**
+
+#### 阶段一：安排“被裁员”的参数 ($)
+```cpp
+// 只有被边缘化的参数预先加入了表 (parameter_block_index_)
+for (auto &block : parameter_block_index_) {
+    block.second = index; 
+    index += localSize(parameter_block_size_[block.first]); 
+}
+```
+- **操作**: 遍历并在矩阵最前端分配空间。
+- **结果**:
+    - `Pose_A`: Index 0~5 (Size 6)
+    - `Vel_A`: Index 6~14 (Size 9)
+    - `marginalized_size_` = 15
+- **对应矩阵区域**: 左上角 5 \times 15$ 的 {mm}$。
+
+#### 阶段二：安排“留任者”的参数 ($)
+```cpp
+// 加入保留的参数
+for (const auto &block : parameter_block_size_) {
+    if (parameter_block_index_.find(block.first) == parameter_block_index_.end()) {
+        parameter_block_index_[block.first] = index;
+        index += localSize(block.second);
+    }
+}
+```
+- **操作**: 遍历所有相关参数，发现不在表中的（即要保留的），追加到后面。
+- **结果**:
+    - `Pose_B`: Index 15~20 (Size 6)
+    - `Vel_B`: Index 21~29 (Size 9)
+    - `remained_size_` = 15
+- **对应矩阵区域**: 右下角 5 \times 15$ 的 {rr}$。
+
+#### 最终内存布局
+所有参数在内存中形成有序队列，确保构建 $ 矩阵时各归其位：
+`| Marginalized (Pose_A, Vel_A) | Remained (Pose_B, Vel_B) |`
+
+## 6. 边缘化操作通俗指南 (The "Hard Parts" Explained)
+
+### 为什么代码看起来如此晦涩？
+`marginalization_info->marginalization()` 之所以难读，是因为它在用 C++ 手动实现数学上的 **Schur Complement (舒尔补)** 和 **Sparse Matrix Assembly (稀疏矩阵组装)**。它不是在调用一个现成的函数，而是在“制造”一个新的 Factor。
+
+### 核心流程图解
+
+我们可以把边缘化想象成一个 **“打包压缩”** 的过程：
+
+**输入 (Raw Ingredients)**: 
+- 最老帧 ($) 的状态。
+- 所有连接在 $ 上的“弹簧” (Factors)：
+    1.  \leftrightarrow T_1$ 的 IMU 弹簧。
+    2. $ 自身的 GNSS 固定钉子。
+    3. 上一轮留给 $ 的旧先验包。
+
+**机器内部运作 (The Function)**:
+
+1.  **分类 (Sorting)**: 
+    - 机器把所有涉及的变量分成两堆：
+    - **垃圾堆 ($)**: $ 的 Pose, Vel, Bias。这些是要扔掉的。
+    - **保留堆 ($)**: $ 的 Pose, Vel, Bias。这些是还得继续用的。
+
+2.  **拍照 (Evaluate & Backup)**: 
+    - 机器对当前系统的状态拍了一张快照（`preMarginalization`）。
+    - *关键点*: 它虽然要扔掉 $，但它必须记住 $ **临死前最后的样子**（数值）。因为未来的先验是基于这个样子计算偏移量的。
+
+3.  **大乱炖 (Construct $)**:
+    - 机器把所有弹簧（Jacobian）拆下来，拼成一个巨大的受力矩阵 $。
+    - 这个矩阵描述了 $ 和 $ 之间千丝万缕的联系。
+
+4.  **提炼 (Schur Elimination - The Magic)**:
+    - 这是最难懂的数学部分。
+    - 机器问了一个问题：“如果我强制把 $ 移除，那么为了保持系统受力平衡，$ 上需要施加一个什么样的等效力？”
+    - 数学公式 {new} = H_{rr} - H_{rm} H_{mm}^{-1} H_{mr}$ 就是在计算这个“等效力”。
+
+**输出 (The Product)**:
+- 两个核心产物：`linearized_jacobians_` 和 `linearized_residuals_`。
+- **直观理解**: 它们就是一个 **“幽灵弹簧”**。
+- 在下一轮优化中，虽然 $ 不在了，但这个“幽灵弹簧”会连接在 $ 上。
+- 如果 $ 试图乱动（偏离最佳估计），这个幽灵弹簧就会产生拉力（Residual），把他拉回来。这个拉力的大小和方向，就蕴含在刚才计算的那两个矩阵里。
+
+### 代码映射速查
+| 代码函数 | 通俗含义 | 对应数学步骤 |
+| :--- | :--- | :--- |
+| `updateParameterBlocksIndex` | **分堆**：谁留谁走？ | 矩阵分块索引构建 |
+| `preMarginalization` | **拍照**：备份参数，算当前残差 | , e$ 计算与线性化点备份 $ |
+| `constructEquation` | **拼图**：把小雅可比拼成大Hessian |  = \sum J^T J, b = -\sum J^T e$ |
+| `schurElimination` | **压缩**：数学上的“降维打击” |  = H_{rr} - H_{rm}H_{mm}^{-1}H_{mr}$ |
+| `linearization` | **拆解**：把压缩后的H拆回J，喂给Ceres |  \to J_{prior}^T J_{prior}$ |
+
+
+## 7. 边缘化原理与实现 (The Standard Process)
+
+### 1. 理论基础：舒尔补 (Schur Complement)
+
+#### 目标
+我们有一个关于全状态 $ 的线性方程组（通常来自于非线性最小二乘的线性化）：
+2606964 H \Delta x = b 2606964
+其中 $ 是信息矩阵 (Hessian,  = J^T J$)，$ 是信息向量 ( = -J^T e$)。
+
+我们将状态变量 $ 拆分为两部分：
+- $: 需要被边缘化移除的变量 (Marginalized)。
+- $: 需要保留在窗口中的变量 (Remained)。
+
+方程可以分块重写为：
+2606964
+\begin{bmatrix}
+H_{mm} & H_{mr} \
+H_{rm} & H_{rr}
+\end{bmatrix}
+\begin{bmatrix}
+\Delta x_m \
+\Delta x_r
+\end{bmatrix}
+=
+\begin{bmatrix}
+b_m \
+b_r
+\end{bmatrix}
+2606964
+
+#### 核心推导
+利用高斯消元法将 {rm}$ 消为 0。
+首先从第一行解出 $\Delta x_m$：
+2606964 H_{mm} \Delta x_m + H_{mr} \Delta x_r = b_m 2606964
+2606964 \Delta x_m = H_{mm}^{-1} (b_m - H_{mr} \Delta x_r) 2606964
+
+将 $\Delta x_m$ 代入第二行：
+2606964 H_{rm} (H_{mm}^{-1} (b_m - H_{mr} \Delta x_r)) + H_{rr} \Delta x_r = b_r 2606964
+
+整理得到仅关于 $\Delta x_r$ 的方程：
+2606964 (H_{rr} - H_{rm} H_{mm}^{-1} H_{mr}) \Delta x_r = b_r - H_{rm} H_{mm}^{-1} b_m 2606964
+
+#### 结论
+这就诞生了新的线性系统：
+2606964 H^* \Delta x_r = b^* 2606964
+其中：
+- **^* = H_{rr} - H_{rm} H_{mm}^{-1} H_{mr}* ：边缘化后的信息矩阵（先验权重）。
+- **^* = b_r - H_{rm} H_{mm}^{-1} b_m* ：边缘化后的信息向量（先验残差方向）。
+
+### 2. 代码实现流程 (`MarginalizationInfo`)
+
+该类位于 `src/factors/marginalization_info.h`，复现了上述数学过程。
+
+#### Step 1: 收集因子 (`addResidualBlockInfo`)
+- **操作**: 遍历整个滑窗，找出所有即将在边缘化过程中被切断的“边”（Factor）。
+- **对象**:
+    1. `MarginalizationFactor` (上一轮的先验)。
+    2. `PreintegrationFactor` (与 Frame 0 相关的 IMU 约束)。
+    3. `GnssFactor` (Frame 0 的 GNSS 约束)。
+- **存储**: 存入 `factors` 列表。每个 Factor 包含残差计算器、涉及的参数块指针。
+
+#### Step 2: 预处理与备份 (`preMarginalization`)
+- **线性化点备份**:
+    - 在 $ 被立刻丢弃之前，必须深拷贝备份它当前的数值 (`parameter_block_data`)。
+    - **原因**: 将来的“先验因子”是基于  = \bar{x} + \Delta x$ 展开的。我们必须记住 $ 这一刻的值 $\bar{x}$，哪怕它已经不在优化窗口里了。
+- **构建索引**:
+    - 扫描所有参数块，建立全局索引映射。
+    - 区分 $ (indices in `marginalization_parameter_blocks_`) 和 $ (indices in `keep_parameter_blocks_`)。
+    - 确定矩阵 $ 的总维度 $ 以及 $ 维的大小。
+
+#### Step 3: 构造线性方程 (`constructEquation`)
+- **多线程加速**: 开启多线程遍历所有 `factors`。
+- **计算块雅可比**: 对每个 Factor 调用 `Evaluate`，得到局部残差 $ 和局部雅可比 $。
+- **组装大矩阵 (, b$)**:
+    2606964 H = \sum J_i^T J_i 2606964
+    2606964 b = \sum -J_i^T e_i 2606964
+    - 代码中通过 `mapping` 将局部参数块的索引映射到全局矩阵 $ 的位置，进行累加。
+
+#### Step 4: 舒尔补压缩 (`schurElimination`)
+- **分块构造**:
+    - 提取 {mm}, H_{mr}, H_{rm}, H_{rr}$。
+    - 提取 , b_r$。
+- **求逆与运算**:
+    - 计算 {mm}^{-1}$ (通常使用 Cholesky分解 `ldlt().solve()` 或自伴随特征值分解 `inverse()`, 代码中使用 `inverse()`)。
+    - 执行矩阵乘法 ^* = H_{rr} - H_{rm} H_{mm}^{-1} H_{mr}$。
+    - 执行向量运算 ^* = b_r - H_{rm} H_{mm}^{-1} b_m$。
+
+#### Step 5: 分解与恢复 (`linearization`)
+- **问题**: Ceres 的接口需要的是残差 $ 和雅可比 $，而不是 $ 和 $。我们需要把 ^* \Delta x = b^*$ 变回 $\min || J \Delta x - e ||^2$ 的形式。
+- **雅可比恢复**:
+    - 对 ^*$ 进行特征值分解 (Eigen Value Decomposition): ^* = V S V^T$。
+    - 取  = S^{1/2} V^T$。
+    - 此时 ^T J = V S^{1/2} S^{1/2} V^T = V S V^T = H^*$，还原成功。
+- **残差恢复**:
+    - 构造线性化残差  = - (J^T)^{-1} b^*$。
+- **产出**:
+    - `linearized_jacobians_`: 恢复出的 $。
+    - `linearized_residuals_`: 恢复出的 $。
+    - 这两个变量被传递给下一帧的 `MarginalizationFactor`。
+
+### 3. 下一轮的使用 (`MarginalizationFactor::Evaluate`)
+
+当下一轮优化发生时，Ceres 调用边缘化因子的 `Evaluate` 函数：
+
+**公式**:
+2606964 e_{total} = e_{prior} + J_{prior} \Delta x 2606964
+
+**代码对应**:
+Pre-calculated values stored in the factor:
+- **{prior}*: `linearized_residuals_`
+- **{prior}*: `linearized_jacobians_`
+
+Implementation:
+```cpp
+Eigen::Map<Eigen::VectorXd>(residuals, n) = 
+    marginalization_info->linearized_residuals_ + 
+    marginalization_info->linearized_jacobians_ * dx;
+```
+
+- **$\Delta x*: 当前优化变量 $ 相对于上一轮备份的线性化点 $\bar{x}$ 的偏差。
+
+这样，虽然 $ 已经从状态向量中移除了，但它留下的信息（即它对 $ 的约束）被转化为了这个二次型先验项，参与新的代价函数计算。

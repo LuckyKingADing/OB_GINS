@@ -41,8 +41,10 @@ public:
 
         // parameters: vel[3], bg[3], ba[3]
 
+        // 计算残差
         preintegration_->imuErrorEvaluate(parameters, residuals);
 
+        // 计算雅可比
         if (jacobians) {
             if (jacobians[0]) {
                 preintegration_->imuErrorJacobian(jacobians[0]);

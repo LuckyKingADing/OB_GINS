@@ -53,7 +53,7 @@ public:
         // !!!硬核：计算残差residual
         preintegration_->evaluate(state0, state1, residuals);
 
-        // 计算雅可比
+        // 计算雅可比：在 Ceres Solver 中，残差 r 关于优化变量 x 的导数即雅可比矩阵Jacbobian决定了优化的下降方向；雅可比矩阵分成四个子矩阵， Jacobian(19x34) = [Jacobian(19x7), Jacobian(19x10), Jacobian(19x7), Jacobian(19x10)]
         // 这里分别计算残差对 4 个参数块的偏导数。
         if (jacobians) {
             if (jacobians[0]) { // jacobians[0] 对应第一个参数块 Pose0 (上一帧位姿)

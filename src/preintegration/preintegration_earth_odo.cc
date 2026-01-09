@@ -132,53 +132,77 @@ Eigen::MatrixXd PreintegrationEarthOdo::evaluate(const IntegrationState &state0,
         // ODO比例因子常数残差，比例因子 (Scale Factor, sodo) 建模为随机游走，残差即为前后时刻比例因子的变化量。
     residual(18)                = state1.sodo - state0.sodo;
 
-    // 信息矩阵加权：乘以信息矩阵的平方根，完成白化处理
+    // 对residual残差进行加权，信息矩阵加权：乘以信息矩阵的平方根，完成白化处理
     residual = sqrt_information_ * residual;
 
     return residual;
 }
 
+/* 计算上一个节点位置、姿态四元数参数的系数 */
 Eigen::MatrixXd PreintegrationEarthOdo::residualJacobianPose0(const IntegrationState &state0,
-                                                              const IntegrationState &state1, double *jacobian) {
-    Eigen::Map<Eigen::Matrix<double, NUM_STATE, NUM_POSE, Eigen::RowMajor>> jaco(jacobian);
+                                                              const IntegrationState &state1, double *jacobian) {                                    
+    // NUM_STATE = 19, NUM_POSE = 7
+    // 指定jacobian指针为Eigen矩阵格式，方便后续操作
+    Eigen::Map<Eigen::Matrix<double, NUM_STATE, NUM_POSE, Eigen::RowMajor>> jaco(jacobian); 
     jaco.setZero();
 
-    Matrix3d cnb0 = state0.q.inverse().toRotationMatrix();
+    // state0.q表示t时刻imu载体系b0系相对于导航系/世界系n系的旋转四元数，也就是把向量从b0系旋转到n系的四元数，.inverse()表示四元数的共轭，表示把向量从n系旋转到b0系的四元数，最后转换为旋转矩阵
+    Matrix3d cnb0 = state0.q.inverse().toRotationMatrix(); // 公式： R^T，表示从n系到b0系的旋转矩阵
 
+    // 位置残差对位置、姿态参数的导数
+         /* jaco.block(0, 0, 3, 3)：
+            这是一个提取子矩阵的函数，参数含义依次是：
+            0 (startRow): 从第 0 行开始。
+            0 (startCol): 从第 0 列开始。
+            3 (numRows): 向下取 3 行。
+            3 (numCols): 向右取 3 列 */
     jaco.block(0, 0, 3, 3) = -cnb0 - 2.0 * cnb0 * iewn_skew_ * delta_time_;
     jaco.block(0, 3, 3, 3) = Rotation::skewSymmetric(cnb0 * dpn_);
+    // 速度残差对位置、姿态参数的导数
     jaco.block(3, 0, 3, 3) = -2.0 * cnb0 * iewn_skew_;
     jaco.block(3, 3, 3, 3) = Rotation::skewSymmetric(cnb0 * dvn_);
+    // 姿态残差对姿态参数的导数
     jaco.block(6, 3, 3, 3) =
         (Rotation::quaternionleft(qb0b1_) * Rotation::quaternionright(corrected_q_)).bottomRightCorner<3, 3>();
+    // odo里程残差对位置、姿态参数的导数
     jaco.block(15, 0, 3, 3) = -cnb0;
     jaco.block(15, 3, 3, 3) = Rotation::skewSymmetric(cnb0 * (state1.p - state0.p));
 
+    // 对雅可比矩阵进行加权，信息矩阵加权：乘以信息矩阵的平方根，完成白化处理
     jaco = sqrt_information_ * jaco;
     return jaco;
 }
 
+/* 计算下一个节点位置、姿态四元数参数的系数。 */
 Eigen::MatrixXd PreintegrationEarthOdo::residualJacobianPose1(const IntegrationState &state0,
                                                               const IntegrationState &state1, double *jacobian) {
+    // NUM_STATE = 19, NUM_POSE = 7
     Eigen::Map<Eigen::Matrix<double, NUM_STATE, NUM_POSE, Eigen::RowMajor>> jaco(jacobian);
     jaco.setZero();
 
     Matrix3d cnb0 = state0.q.inverse().toRotationMatrix();
 
+    // 位置残差对位置、姿态参数的导数
     jaco.block(0, 0, 3, 3)  = cnb0;
     jaco.block(3, 0, 3, 3)  = 2.0 * cnb0 * iewn_skew_;
-    jaco.block(6, 3, 3, 3)  = -Rotation::quaternionright(qb0b1_ * corrected_q_).bottomRightCorner<3, 3>();
+    // 姿态残差对姿态参数的导数
+    jaco.block(6, 3, 3, 3)  = -Rotation::quaternionright(qb0b1_ * corrected_q_).bottomRightCorner<3, 3>(); // quaternionright：四元数右乘矩阵；bottomRightCorner<3,3>()：取出矩阵的右下角3x3子矩阵
+    // odo里程残差对位置、姿态参数的导数
     jaco.block(15, 0, 3, 3) = cnb0;
 
+    // 信息矩阵加权
     jaco = sqrt_information_ * jaco;
     return jaco;
 }
 
+/* 计算上一个节点速度、陀螺仪零偏、加速度计零偏、ODO比例因子参数的系数。 */
 Eigen::MatrixXd PreintegrationEarthOdo::residualJacobianMix0(const IntegrationState &state0,
                                                              const IntegrationState &state1, double *jacobian) {
+    // NUM_STATE = 19, NUM_MIX = 10
     Eigen::Map<Eigen::Matrix<double, NUM_STATE, NUM_MIX, Eigen::RowMajor>> jaco(jacobian);
     jaco.setZero();
 
+    // 取出雅可比矩阵中的一阶导数
     Matrix3d dp_dbg   = jacobian_.block<3, 3>(0, 9);
     Matrix3d dp_dba   = jacobian_.block<3, 3>(0, 12);
     Matrix3d dv_dbg   = jacobian_.block<3, 3>(3, 9);
@@ -189,39 +213,53 @@ Eigen::MatrixXd PreintegrationEarthOdo::residualJacobianMix0(const IntegrationSt
 
     Matrix3d cnb0 = state0.q.inverse().toRotationMatrix();
 
+    // 位置残差对速度、陀螺仪bias、加速度计bias参数的导数
     jaco.block(0, 0, 3, 3)  = -cnb0 * delta_time_;
     jaco.block(0, 3, 3, 3)  = -dp_dbg;
     jaco.block(0, 6, 3, 3)  = -dp_dba;
+    // 速度残差对速度、陀螺仪bias、加速度计bias参数的导数
     jaco.block(3, 0, 3, 3)  = -cnb0;
     jaco.block(3, 3, 3, 3)  = -dv_dbg;
     jaco.block(3, 6, 3, 3)  = -dv_dba;
-    jaco.block(6, 3, 3, 3)  = Rotation::quaternionleft(qb0b1_ * delta_state_.q).bottomRightCorner<3, 3>() * dq_dbg;
+    // 姿态残差对陀螺仪bias参数的导数    
+    jaco.block(6, 3, 3, 3)  = Rotation::quaternionleft(qb0b1_ * delta_state_.q).bottomRightCorner<3, 3>() * dq_dbg; // bottomRightCorner<3,3>()：取出矩阵的右下角3x3子矩阵；quaternionleft：四元数左乘矩阵
+    // 陀螺仪残差对陀螺仪bias参数的导数
     jaco.block(9, 3, 3, 3)  = -Eigen::Matrix3d::Identity();
+    // 加速度计残差对加速度计bias参数的导数
     jaco.block(12, 6, 3, 3) = -Eigen::Matrix3d::Identity();
+    // ODO里程残差对陀螺仪bias、ODO比例因子的导数
     jaco.block(15, 3, 3, 3) = -ds_dbg;
     jaco.block(15, 9, 3, 1) = -ds_dsodo;
+    // ODO比例因子残差对ODO比例因子残差的导数
     jaco(18, 9)             = -1.0;
 
+    // 信息矩阵加权
     jaco = sqrt_information_ * jaco;
     return jaco;
 }
 
+/* 计算下一个节点速度、陀螺仪零偏、加速度计零偏、ODO比例因子参数的系数。 */
 Eigen::MatrixXd PreintegrationEarthOdo::residualJacobianMix1(const IntegrationState &state0,
                                                              const IntegrationState &state1, double *jacobian) {
     Eigen::Map<Eigen::Matrix<double, NUM_STATE, NUM_MIX, Eigen::RowMajor>> jaco(jacobian);
     jaco.setZero();
 
+    // 速度残差对速度参数的导数
     jaco.block(3, 0, 3, 3)  = state0.q.inverse().toRotationMatrix();
+    // 陀螺仪残差对陀螺仪bias的导数
     jaco.block(9, 3, 3, 3)  = Eigen::Matrix3d::Identity();
+    // 加速度计残差对加速度计bias的导数
     jaco.block(12, 6, 3, 3) = Eigen::Matrix3d::Identity();
+    // ODO比例因子残差对比例因子的导数
     jaco(18, 9)             = 1.0;
 
+    // 信息矩阵加权
     jaco = sqrt_information_ * jaco;
     return jaco;
 }
 
 int PreintegrationEarthOdo::numResiduals() {
-    return NUM_STATE; // 15 维（位置3 + 速度3 + 姿态3 + 陀螺零偏3 + 加计零偏3
+    return NUM_STATE; // 19 维（位置3，速度3，姿态3，陀螺零偏3，加速度零偏3，里程计位置3，里程计比例因子1）
 }
 
 vector<int> PreintegrationEarthOdo::numBlocksParameters() {
@@ -543,7 +581,9 @@ vector<int> PreintegrationEarthOdo::imuErrorNumBlocksParameters() {
     return std::vector<int>{NUM_MIX};
 }
 
+/* 假设陀螺仪、加速度计零偏和ODO比例因子的初始值为0，计算残差。*/
 void PreintegrationEarthOdo::imuErrorEvaluate(const double *const *parameters, double *residuals) {
+    // 公式：ri = (bi - bi0) / σ_bi，中文：残差等于当前估计的偏置减去初始偏置，再除以偏置的标准差，表示偏置的归一化误差，初始偏置一般为零
     // bg, ba
     residuals[0] = parameters[0][3] / IMU_GRY_BIAS_STD;
     residuals[1] = parameters[0][4] / IMU_GRY_BIAS_STD;
@@ -555,10 +595,12 @@ void PreintegrationEarthOdo::imuErrorEvaluate(const double *const *parameters, d
 }
 
 void PreintegrationEarthOdo::imuErrorJacobian(double *jacobian) {
+    // NUM_ERROR_RESIDUAL = 7, NUM_MIX = 10;
     Eigen::Map<Eigen::Matrix<double, NUM_ERROR_RESIDUAL, NUM_MIX, Eigen::RowMajor>> jaco(jacobian);
 
     jaco.setZero();
 
+    // 对应的系数都是1除以标准差
     jaco(0, 3) = 1.0 / IMU_GRY_BIAS_STD;
     jaco(1, 4) = 1.0 / IMU_GRY_BIAS_STD;
     jaco(2, 5) = 1.0 / IMU_GRY_BIAS_STD;

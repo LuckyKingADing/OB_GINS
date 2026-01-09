@@ -23,8 +23,8 @@
 #ifndef RESIDUAL_BLOCK_INFO_H
 #define RESIDUAL_BLOCK_INFO_H
 
-#define POSE_LOCAL_SIZE 6
-#define POSE_GLOBAL_SIZE 7
+#define POSE_LOCAL_SIZE 6  // 位置(3) + 旋转向量(3)
+#define POSE_GLOBAL_SIZE 7 // 位置(3) + 四元数(4)
 
 #include <ceres/ceres.h>
 #include <memory>
@@ -44,6 +44,7 @@ public:
     void Evaluate() {
         residuals_.resize(cost_function_->num_residuals());
 
+        // 准备内存与调用原始 Evaluate
         std::vector<int> block_sizes = cost_function_->parameter_block_sizes();
         auto raw_jacobians           = new double *[block_sizes.size()];
         jacobians_.resize(block_sizes.size());
@@ -52,21 +53,24 @@ public:
             jacobians_[i].resize(cost_function_->num_residuals(), block_sizes[i]);
             raw_jacobians[i] = jacobians_[i].data();
         }
+            // 调用 ceres 的 Evaluate 方法计算残差和雅可比矩阵
         cost_function_->Evaluate(parameter_blocks_.data(), residuals_.data(), raw_jacobians);
 
         delete[] raw_jacobians;
-
-        if (loss_function_) {
+ 
+        // 鲁棒核函数加权 (Critical Step)
+        if (loss_function_) { // 如果配置了 loss_function_（如 Huber Loss），
             // 鲁棒核函数调整, 参考ceres/internal/ceres/corrector.cc
             double residual_scaling, alpha_sq_norm;
 
             double sq_norm, rho[3];
 
             sq_norm = residuals_.squaredNorm();
-            loss_function_->Evaluate(sq_norm, rho);
+            loss_function_->Evaluate(sq_norm, rho); // 调用 ceres 提供的 Evaluate 方法计算sq_norm对应的 rho
 
             double sqrt_rho1 = sqrt(rho[1]);
 
+            // 计算 Scaling Factor (缩放因子)：
             if ((sq_norm == 0.0) || (rho[2] <= 0.0)) {
                 residual_scaling = sqrt_rho1;
                 alpha_sq_norm    = 0.0;
@@ -83,6 +87,7 @@ public:
                 jacobians_[i] =
                     sqrt_rho1 * (jacobians_[i] - alpha_sq_norm * residuals_ * (residuals_.transpose() * jacobians_[i]));
             }
+            // 残差修正公式，乘以缩放因子
             residuals_ *= residual_scaling;
         }
     }

@@ -117,11 +117,20 @@ public:
 protected:
     // 待办：可以根据你的IMU设置这些参数，参数包括陀螺和加速度计的零偏标准差、比例因子标准差，ODO比例因子标准差等
     // TODO: You can set these parameters according to your IMU
-    static constexpr double IMU_GRY_BIAS_STD = 7200 / 3600.0 * M_PI / 180.0; // 7200 deg / hr
-    static constexpr double IMU_ACC_BIAS_STD = 2.0e4 * 1.0e-5;               // 20000 mGal
-    static constexpr double IMU_SCALE_STD    = 5.0e3 * 1.0e-6;               // 5000 PPM
-    static constexpr double IMU_ACC_Z_SCALE  = 100;
-    static constexpr double ODO_SCALE_STD    = 2.0e4 * 1.0e-6; // 0.02
+
+    // 这些是宽泛的、保护性的工程经验上限。而不是从配置文件读取的
+    // 配置文件中的imu参数包括： IMU噪声建模参数：角速度随机游走、加速度随机游走、陀螺零偏稳定性标准差、加速度零偏稳定性标准差、相关时间、odo比例因子误差
+    // 这里的参数是经验上限，用于预积分过程中的数值稳定性；注意区分两者区别和用途。详细见MyNotes.md中的说明
+    static constexpr double IMU_GRY_BIAS_STD = 7200 / 3600.0 * M_PI / 180.0; // 7200 deg / hr  2 deg/s   imu陀螺零偏误差放大
+    static constexpr double IMU_ACC_BIAS_STD = 2.0e4 * 1.0e-5;               // 20000 mGal = 0.2 m/s²    imu加速度计零偏误差放大
+    static constexpr double IMU_SCALE_STD    = 5.0e3 * 1.0e-6;               // 5000 PPM  = 0.005  0.5%  imu比例因子误差放大
+    static constexpr double IMU_ACC_Z_SCALE  = 100; // 100倍加速度计Z轴比例因子误差放大，增强数值稳定性
+    static constexpr double ODO_SCALE_STD    = 2.0e4 * 1.0e-6; // 0.02 2% 20000PM  里程计比例因子误差放大
+    /* PS： 
+        1.要合理设置噪声参数，std最好是常值零偏(IMU 手册里给的零偏不稳定性（Bias Instability）)的3倍以上。
+        2.约束零偏常量大小，相当于先验约束，对系统初始化的稳定性有较好的作用，在边缘化之后有了先验约束，这个约束的作用将会减小。
+        3.这个约束因子和GVINS中的GNSS/INS紧组合优化的接收机钟差因子，功能非常类似，都是有利于系统初始化。 */
+
 
     const std::shared_ptr<IntegrationParameters> parameters_;
 

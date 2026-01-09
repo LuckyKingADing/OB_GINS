@@ -380,7 +380,7 @@ int main(int argc, char *argv[]) {
                         -这条边（IMU 预积分约束）是一个 4 元边（4-ary edge），它同时连接了 4 个变量节点。Ceres 完全支持这种多元约束 */
                     );
                 }
-                // 添加IMU零偏误差约束：仅作用于当前最新的那个状态（窗口末端的帧），边界约束，防止最新的零偏估计值因为缺乏约束而“飞，原因：防止漂移：虽然上一段代码限制了 Bias 的变化率（Random Walk），但在弱观测（如长时间缺乏有效 GNSS）或刚开始初始化时，Bias 的绝对值可能会因为缺乏全局观测而整体漂移
+                // 添加IMU零偏误差约束：仅作用于当前最新的那个状态（窗口末端的帧），边界约束，防止最新的零偏估计值因为缺乏约束而“飞，原因：防止漂移：虽然上一段代码限制了 Bias 的变化率（Random Walk），但在弱观测（如长时间缺乏有效 GNSS）或刚开始初始化时，Bias 的绝对值可能会因为缺乏全局观测而整体漂移；加上约束后：这个因子就像一个弹簧，它连接着 零偏值 和 0。它告诉优化器：“零偏可以在一定范围内变动，但如果偏离 0 太远，代价会非常大
                 // add IMU bias-constraint factors
                 {   // IMU误差控制
                     // add IMU bias-constraint factors
@@ -515,88 +515,108 @@ int main(int argc, char *argv[]) {
                 {
                     // 边缘化
                     // marginalization
-                    std::shared_ptr<MarginalizationInfo> marginalization_info = std::make_shared<MarginalizationInfo>();
-                    if (last_marginalization_info && last_marginalization_info->isValid()) {
+                    std::shared_ptr<MarginalizationInfo> marginalization_info = std::make_shared<MarginalizationInfo>(); // 创建边缘化信息对象
+                    if (last_marginalization_info && last_marginalization_info->isValid()) { // 如果上一个边缘化信息存在且有效，则将其作为先验因子加入当前边缘化任务中，保证历史信息的递归传递
 
                         std::vector<int> marginilized_index;
-                        for (size_t k = 0; k < last_marginalization_parameter_blocks.size(); k++) {
-                            if (last_marginalization_parameter_blocks[k] == statedatalist[0].pose ||
+                        for (size_t k = 0; k < last_marginalization_parameter_blocks.size(); k++) { // 找出需要边缘化的参数块索引
+                            // 如果上一个边缘化参数块是当前滑动窗口中的第0帧的位姿或混合状态，则将其索引加入边缘化索引列表
+                            if (last_marginalization_parameter_blocks[k] == statedatalist[0].pose || 
                                 last_marginalization_parameter_blocks[k] == statedatalist[0].mix) {
-                                marginilized_index.push_back(static_cast<int>(k));
+                                marginilized_index.push_back(static_cast<int>(k)); // 
                             }
                         }
 
-                        auto factor   = std::make_shared<MarginalizationFactor>(last_marginalization_info);
-                        auto residual = std::make_shared<ResidualBlockInfo>(
-                            factor, nullptr, last_marginalization_parameter_blocks, marginilized_index);
-                        marginalization_info->addResidualBlockInfo(residual);
+                        auto factor   = std::make_shared<MarginalizationFactor>(last_marginalization_info); // 创建边缘化因子对象
+                        auto residual = std::make_shared<ResidualBlockInfo>( 
+                            factor, nullptr, last_marginalization_parameter_blocks, marginilized_index); // 创建残差块信息对象，传入边缘化因子、参数块和边缘化索引
+                        marginalization_info->addResidualBlockInfo(residual); // 将残差块信息加入边缘化信息对象中
                     }
 
-                    // IMU残差
+                    // 添加残差块（addResidualBlockInfo函数）：依次添加之前的边缘化残差因子、最老的IMU预积分残差因子、最老的GNSS残差因子。
+                    // 收集与第0帧有关的约束，要移除第0帧，必须找到所有直接连接到它的因子：
+                    
+                    // 预积分因子，IMU残差
                     // preintegration factors
                     {
-                        auto factor   = std::make_shared<PreintegrationFactor>(preintegrationlist[0]);
+                        auto factor   = std::make_shared<PreintegrationFactor>(preintegrationlist[0]); // 创建预积分因子对象，preintegrationlist[0]对应滑动窗口中的第0帧和第1帧之间的预积分约束
+
+                        // residual block info
+                        // 涉及参数：Pose0, Mix0, Pose1, Mix1
+                        // 待移除参数索引：{0, 1} (即 Pose0 和 Mix0)
+                        // 含义：移除 Pose0 后，它对 Pose1 的约束会变成 Pose1 的先验信息。
                         auto residual = std::make_shared<ResidualBlockInfo>(
                             factor, nullptr,
-                            std::vector<double *>{statedatalist[0].pose, statedatalist[0].mix, statedatalist[1].pose,
-                                                  statedatalist[1].mix},
-                            std::vector<int>{0, 1});
-                        marginalization_info->addResidualBlockInfo(residual);
+                            std::vector<double *>{statedatalist[0].pose, statedatalist[0].mix, statedatalist[1].pose, statedatalist[1].mix},
+                            std::vector<int>{0, 1}); // std::vector<int>{0, 1} 表示要边缘化的参数块索引，这里是第0帧的位姿和混合状态，在之后的marginalization()函数中会使用这个索引来识别哪些参数需要被边缘化
+                        marginalization_info->addResidualBlockInfo(residual); // 将残差块信息加入边缘化信息对象中
                     }
 
                     // GNSS残差
                     // GNSS factors
                     {
-                        if (fabs(timelist[0] - gnsslist[0].time) < MINIMUM_INTERVAL) {
-                            auto factor   = std::make_shared<GnssFactor>(gnsslist[0], antlever);
+                        if (fabs(timelist[0] - gnsslist[0].time) < MINIMUM_INTERVAL) { // 如果滑动窗口中的第0帧时间和第0个GNSS时间基本相等，说明第0帧受到了GNSS约束
+                            auto factor   = std::make_shared<GnssFactor>(gnsslist[0], antlever); // 创建GNSS因子对象
+
+                            // 创建残差块信息对象，只边缘化第0帧的位姿参数
                             auto residual = std::make_shared<ResidualBlockInfo>(
-                                factor, nullptr, std::vector<double *>{statedatalist[0].pose}, std::vector<int>{});
+                                factor, nullptr, std::vector<double *>{statedatalist[0].pose}, std::vector<int>{});  // 
                             marginalization_info->addResidualBlockInfo(residual);
                         }
                     }
 
-                    // 边缘化处理
+                    // !!!核心：边缘化处理，输出：linearized_jacobians_ 和 linearized_residuals_，在 marginalization_factor.h（MarginalizationFactor 类）的 Evaluate 函数中被使用，当 Ceres 求解器在下一轮优化中试图计算“边缘化先验因子”的误差时，它会取出这两个存储好的矩阵和向量。
+                    /* PS：被使用的位置// e = e0 + J0 * dx
+                            Eigen::Map<Eigen::VectorXd>(residuals, remained_size) =
+                            marg_info_->linearizedResiduals() + marg_info_->linearizedJacobians() * dx;*/
                     // do marginalization
                     marginalization_info->marginalization();
 
-                    // 数据指针调整
+                    // 数据指针调整：内存地址映射 (Address Remapping)
                     // get new pointers
+                    // 更新数据指针
+                    // 更新边缘化信息的数据地址，将边缘化更新后的最老节点和次老节点的关系，作为下次优化的先验信息。
                     std::unordered_map<long, double *> address;
-                    for (size_t k = 1; k <= preintegrationlist.size(); k++) {
+                    for (size_t k = 1; k <= preintegrationlist.size(); k++) { // 遍历滑动窗口内的所有状态节点 (k)，将第0帧之后的状态节点的数据指针重新映射到新的索引，整体前移一位
                         address[reinterpret_cast<long>(statedatalist[k].pose)] = statedatalist[k - 1].pose;
                         address[reinterpret_cast<long>(statedatalist[k].mix)]  = statedatalist[k - 1].mix;
                     }
-                    last_marginalization_parameter_blocks = marginalization_info->getParamterBlocks(address);
-                    last_marginalization_info             = std::move(marginalization_info);
+                    // //下次优化的先验信息，次老节点的相关信息
+                    last_marginalization_parameter_blocks = marginalization_info->getParamterBlocks(address); //
+                    last_marginalization_info             = std::move(marginalization_info); // 将包含 jacobian/residual 的 info 对象 move 给全局变量
                 }
 
                 // 滑窗处理
                 // sliding window
                 {
-                    if (lround(timelist[0]) == lround(gnsslist[0].time)) {
-                        gnsslist.pop_front();
+                    // 删除最老的观测数据
+                    if (lround(timelist[0]) == lround(gnsslist[0].time)) { // 如果滑动窗口中的第0帧时间和第0个GNSS时间基本相等，说明第0帧受到了GNSS约束
+                        gnsslist.pop_front(); // 移除第0个GNSS数据
                     }
-                    timelist.pop_front();
-                    preintegrationlist.pop_front();
+                    timelist.pop_front(); // 移除第0个时间节点
+                    preintegrationlist.pop_front(); // 移除第0个预积分对象
 
-                    for (int k = 0; k < windows; k++) {
+                    // 覆盖最老的状态参数数据
+                    for (int k = 0; k < windows; k++) { // 整体前移状态和状态数据
                         statedatalist[k] = statedatalist[k + 1];
-                        statelist[k]     = Preintegration::stateFromData(statedatalist[k], preintegration_options);
+                        statelist[k]     = Preintegration::stateFromData(statedatalist[k], preintegration_options); // 将状态数据转换为状态向量
                     }
-                    statelist[windows] = Preintegration::stateFromData(statedatalist[windows], preintegration_options);
-                    state_curr         = statelist[windows];
+                    statelist[windows] = Preintegration::stateFromData(statedatalist[windows], preintegration_options); // 更新最后一个状态 (感觉放到上面的循环中也行？)
+                    state_curr         = statelist[windows]; // 当前状态更新为滑动窗口中的最后一个状态
                 }
-            } else {
+            } else { // 滑动窗口未满，不进行边缘化处理
+                // 根据preintegrationlist的大小，取出最后一个状态作为当前状态
                 state_curr =
                     Preintegration::stateFromData(statedatalist[preintegrationlist.size()], preintegration_options);
             }
 
+            // 写入结果
             // write result
             writeNavResult(*timelist.rbegin(), station_origin, state_curr, navfile, errfile);
 
-            // 新建立新的预积分
+            // 新建立新的预积分，用于下一个积分周期
             // build a new preintegration object
-            preintegrationlist.emplace_back(
+            preintegrationlist.emplace_back( // emplace_back：在预积分列表末尾添加一个新的预积分对象
                 Preintegration::createPreintegration(parameters, imu_pre, state_curr, preintegration_options));
         } else {
             // imu_cur.time <= sow,不进入积分，只记录轨迹点，然后继续读取下一个IMU数据并加入预积分 addNewImu()
@@ -605,11 +625,13 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    // 关闭文件指针
     navfile.close();
     errfile.close();
     imufile.close();
     gnssfile.close();
 
+    // 记录时间
     auto te = absl::Now();
     std::cout << std::endl << std::endl << "Cost " << absl::ToDoubleSeconds(te - ts) << " s in total" << std::endl;
 
